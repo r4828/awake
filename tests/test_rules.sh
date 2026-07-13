@@ -11,12 +11,14 @@ PMSET_LOG="$TEST_ROOT/pmset.log"
 TEST_HOME="$TEST_ROOT/home"
 MATCH_FILE="$TEST_ROOT/process-match"
 BATTERY_PCT_FILE="$TEST_ROOT/battery-pct"
+TEST_SHELL_PID="$BASHPID"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
-cleanup() {
+cleanup_test_root() {
+    [ "$BASHPID" = "$TEST_SHELL_PID" ] || return 0
     rm -rf "$TEST_ROOT"
 }
-trap cleanup EXIT
+trap cleanup_test_root EXIT
 
 cat > "$STUB_BIN/sudo" <<'EOF'
 #!/bin/bash
@@ -123,6 +125,7 @@ setup_state() {
     STATE_FILE="$dir/awake-state"
     LAST_ACTIVE_FILE="$dir/awake-last-active"
     CAFFEINE_PID_FILE="$dir/awake-caffeinate.pid"
+    CAFFEINE_PID_START_FILE="$dir/awake-caffeinate-pid-start"
     FOR_PID_FILE="$dir/awake-for.pid"
     FOR_END_FILE="$dir/awake-for-end"
     FOR_TOKEN_FILE="$dir/awake-for-token"

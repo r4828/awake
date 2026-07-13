@@ -1571,6 +1571,7 @@ class AwakeViewModel: ObservableObject {
     private var lastUpdateFailureAt: Date?
     private var tempFetchInFlight = false
     private var updateFetchInFlight = false
+    private var refreshGeneration: UInt64 = 0
     private var onboardingEvaluated = false
     private var criticalBatteryActionTriggered = false
 
@@ -1646,6 +1647,8 @@ class AwakeViewModel: ObservableObject {
     }
 
     func refreshAsync() {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         maybeRefreshCpuTemperature()
         maybeRefreshUpdateStatus()
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1661,6 +1664,7 @@ class AwakeViewModel: ObservableObject {
             let setupSnapshot = self.fetchSetupSnapshot()
 
             DispatchQueue.main.async {
+                guard generation == self.refreshGeneration else { return }
                 self.applyRefresh(
                     state: state, agents: agents, hookResult: hookResult,
                     battery: battery, isDaemon: isDaemon, isTimer: isTimer,

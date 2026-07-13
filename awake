@@ -51,20 +51,23 @@ MODE_FILE="$HOME/.config/awake/default-mode"
 RULES_DIR="$HOME/.config/awake/rules.d"
 INSTALL_METADATA_FILE="$HOME/.config/awake/install-metadata.json"
 UPDATE_CACHE_FILE="$HOME/.config/awake/update-cache.json"
-PID_FILE="/tmp/awake.pid"
-DAEMON_LOCK_DIR="/tmp/awake-daemon.lock"
+RUNTIME_DIR="${AWAKE_RUNTIME_DIR:-/tmp}"
+PID_FILE="$RUNTIME_DIR/awake.pid"
+DAEMON_LOCK_DIR="$RUNTIME_DIR/awake-daemon.lock"
 DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
-LEASES_DIR="/tmp/awake-leases"
-STATE_FILE="/tmp/awake-state"
-LAST_ACTIVE_FILE="/tmp/awake-last-active"
-CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
-FOR_PID_FILE="/tmp/awake-for.pid"
-FOR_END_FILE="/tmp/awake-for-end"
-FOR_TOKEN_FILE="/tmp/awake-for-token"
-FOR_WAIT_FILE="/tmp/awake-for-waiting"
-DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
-WHY_FILE="/tmp/awake-why"
-BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
+LEASES_DIR="$RUNTIME_DIR/awake-leases"
+STATE_FILE="$RUNTIME_DIR/awake-state"
+LAST_ACTIVE_FILE="$RUNTIME_DIR/awake-last-active"
+CAFFEINE_PID_FILE="$RUNTIME_DIR/awake-caffeinate.pid"
+CAFFEINE_PID_START_FILE="$RUNTIME_DIR/awake-caffeinate-pid-start"
+FOR_PID_FILE="$RUNTIME_DIR/awake-for.pid"
+FOR_END_FILE="$RUNTIME_DIR/awake-for-end"
+FOR_TOKEN_FILE="$RUNTIME_DIR/awake-for-token"
+FOR_WAIT_FILE="$RUNTIME_DIR/awake-for-waiting"
+FOR_PID_START_FILE="$RUNTIME_DIR/awake-for-pid-start"
+DISPLAY_SLEEP_FILE="$RUNTIME_DIR/awake-display-sleep"
+WHY_FILE="$RUNTIME_DIR/awake-why"
+BATTERY_GUARD_FILE="$RUNTIME_DIR/awake-battery-guard"
 LOG_PREFIX="[awake]"
 PACKAGE_NAME="awake-agent"
 GITHUB_RELEASES_URL="https://github.com/nickita-khylkouski/awake/releases/latest"
@@ -78,7 +81,7 @@ log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 now_epoch() { date +%s; }
 
 ensure_runtime_dirs() {
-    mkdir -p "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
+    mkdir -p "$RUNTIME_DIR" "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
 }
 
 json_escape() {
@@ -524,19 +527,20 @@ lease_create_or_update() {
     local expires_at="${6:-}"
     local source="${7:-}"
     ensure_runtime_dirs
-    local dir
+    local dir tmp started_at
     dir="$(lease_dir "$id")"
-    mkdir -p "$dir"
-    if [ ! -f "$dir/started_at" ]; then
-        echo "$(now_epoch)" > "$dir/started_at"
-    fi
-    printf '%s' "$id" > "$dir/id"
-    printf '%s' "$type" > "$dir/type"
-    printf '%s' "$mode" > "$dir/mode"
-    printf '%s' "$reason" > "$dir/reason"
-    printf '%s' "$priority" > "$dir/priority"
-    printf '%s' "$source" > "$dir/source"
-    printf '%s' "${expires_at:-}" > "$dir/expires_at"
+    started_at="$(read_file_value "$dir/started_at" 2>/dev/null || now_epoch)"
+    tmp="$(mktemp -d "${LEASES_DIR}.lease-${id}.XXXXXX")" || return 1
+    printf '%s' "$started_at" > "$tmp/started_at"
+    printf '%s' "$id" > "$tmp/id"
+    printf '%s' "$type" > "$tmp/type"
+    printf '%s' "$mode" > "$tmp/mode"
+    printf '%s' "$reason" > "$tmp/reason"
+    printf '%s' "$priority" > "$tmp/priority"
+    printf '%s' "$source" > "$tmp/source"
+    printf '%s' "${expires_at:-}" > "$tmp/expires_at"
+    rm -rf "$dir"
+    mv "$tmp" "$dir"
 }
 
 lease_remove() {
@@ -638,10 +642,10 @@ clear_manual_leases() {
 
 cancel_timer_session() {
     lease_remove "manual-timer"
-    if [ -f "$FOR_PID_FILE" ]; then
-        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
+    if timer_running; then
+        kill "$(read_file_value "$FOR_PID_FILE")" 2>/dev/null || true
     fi
-    rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE"
+    rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE" "$FOR_PID_START_FILE"
 }
 
 rule_dir() {
@@ -668,6 +672,28 @@ pid_is_alive() {
     local pid="${1:-}"
     [ -n "$pid" ] || return 1
     kill -0 "$pid" 2>/dev/null
+}
+
+process_start_signature() {
+    local pid="${1:-}"
+    pid_is_alive "$pid" || return 1
+    ps -p "$pid" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+caffeinate_running() {
+    local pid expected actual
+    pid="$(read_file_value "$CAFFEINE_PID_FILE")" || return 1
+    [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || return 1
+    expected="$(read_file_value "$CAFFEINE_PID_START_FILE")" || return 1
+    actual="$(process_start_signature "$pid")" || return 1
+    [ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+stop_owned_caffeinate() {
+    if caffeinate_running; then
+        kill "$(read_file_value "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+    fi
+    rm -f "$CAFFEINE_PID_FILE" "$CAFFEINE_PID_START_FILE"
 }
 
 pid_matches_awake_daemon() {
@@ -711,9 +737,19 @@ cleanup_stale_daemon_lease() {
 }
 
 timer_running() {
-    local pid
+    local pid expected actual
     pid="$(read_file_value "$FOR_PID_FILE")" || return 1
-    pid_is_alive "$pid"
+    [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || return 1
+    expected="$(read_file_value "$FOR_PID_START_FILE")" || return 1
+    actual="$(process_start_signature "$pid")" || return 1
+    [ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+cleanup_stale_timer_lease() {
+    if lease_exists "manual-timer" && ! timer_running; then
+        lease_remove "manual-timer"
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE" "$FOR_PID_START_FILE"
+    fi
 }
 
 current_for_token() {
@@ -974,7 +1010,9 @@ install_claude_hooks() {
     fi
     python3 - "$settings" "$LOCAL_BIN_DIR/awake-hook claude" <<'PY'
 import json
+import os
 import sys
+import tempfile
 
 path = sys.argv[1]
 command = sys.argv[2]
@@ -991,9 +1029,11 @@ if not any(
         "matcher": "",
         "hooks": [{"type": "command", "command": command, "timeout": 3}]
     })
-with open(path, "w") as f:
+fd, temp_path = tempfile.mkstemp(prefix=".awake-settings-", dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
+os.replace(temp_path, path)
 PY
 }
 
@@ -1637,10 +1677,7 @@ settings_update_baseline() {
 }
 
 restore_normal_sleep_settings() {
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-        rm -f "$CAFFEINE_PID_FILE"
-    fi
+    stop_owned_caffeinate
     if ! restore_baseline_snapshot; then
         restore_fallback_sleep_settings
     fi
@@ -1662,11 +1699,10 @@ apply_presenting_mode() {
         return 1
     }
     # Kill only the caffeinate process Awake currently owns.
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-    fi
+    stop_owned_caffeinate
     caffeinate -disu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
+    process_start_signature "$!" > "$CAFFEINE_PID_START_FILE"
     echo "nosleep-full" > "$STATE_FILE"
 }
 
@@ -1688,17 +1724,17 @@ apply_running_mode() {
     [ -n "$battery_display" ] && sudo -n pmset -b displaysleep "$battery_display" 2>/dev/null || true
     [ -n "$ac_display" ] && sudo -n pmset -c displaysleep "$ac_display" 2>/dev/null || true
     # Kill only the caffeinate process Awake currently owns.
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-    fi
+    stop_owned_caffeinate
     caffeinate -isu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
+    process_start_signature "$!" > "$CAFFEINE_PID_START_FILE"
     echo "nosleep-display" > "$STATE_FILE"
 }
 
 reconcile_effective_state() {
     cleanup_expired_leases
     cleanup_stale_daemon_lease
+    cleanup_stale_timer_lease
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
@@ -1777,7 +1813,10 @@ cleanup() {
         rm -rf "$dir"
     done
     reconcile_effective_state
-    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$WHY_FILE"
+    rm -f "$PID_FILE" "$LAST_ACTIVE_FILE"
+    if [ "$(lease_count)" -eq 0 ]; then
+        rm -f "$STATE_FILE" "$WHY_FILE"
+    fi
     release_daemon_lock
 }
 
@@ -2040,8 +2079,13 @@ cmd_stop() {
     else
         log "Stopping daemon (PID $pid)..."
         kill "$pid"
-        sleep 1
-        pid_is_alive "$pid" && kill -9 "$pid" 2>/dev/null
+        local attempt=0
+        while [ "$attempt" -lt 50 ]; do
+            pid_matches_awake_daemon "$pid" || break
+            sleep 0.1
+            attempt=$(( attempt + 1 ))
+        done
+        pid_matches_awake_daemon "$pid" && kill -9 "$pid" 2>/dev/null
         log "Stopped"
     fi
 
@@ -2060,7 +2104,7 @@ cmd_stop() {
         rm -rf "$dir"
     done
     reconcile_effective_state
-    rm -f "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE"
+    rm -f "$LAST_ACTIVE_FILE"
 }
 
 cmd_status() {
@@ -2369,14 +2413,16 @@ cmd_rules() {
             [[ "$priority" =~ ^[0-9]+$ ]] || { echo "Priority must be an integer"; return 1; }
             local id
             id="$(printf '%s-%s-%s' "$type" "$value" "$(now_epoch)" | tr ' /' '--' | tr -cd '[:alnum:]._:-')"
-            local dir
+            local dir tmp
             dir="$(rule_dir "$id")"
-            mkdir -p "$dir"
-            printf '%s' "$type" > "$dir/type"
-            printf '%s' "$value" > "$dir/value"
-            printf '%s' "$mode" > "$dir/mode"
-            printf '%s' "${reason:-Rule $type=$value matched}" > "$dir/reason"
-            printf '%s' "$priority" > "$dir/priority"
+            tmp="$(mktemp -d "${RULES_DIR}.rule-${id}.XXXXXX")" || return 1
+            printf '%s' "$type" > "$tmp/type"
+            printf '%s' "$value" > "$tmp/value"
+            printf '%s' "$mode" > "$tmp/mode"
+            printf '%s' "${reason:-Rule $type=$value matched}" > "$tmp/reason"
+            printf '%s' "$priority" > "$tmp/priority"
+            rm -rf "$dir"
+            mv "$tmp" "$dir"
             echo "$id"
             ;;
         rm|remove|delete)
@@ -2426,7 +2472,6 @@ cmd_for() {
     echo "$end_epoch" > "$FOR_END_FILE"
     echo "$token" > "$FOR_TOKEN_FILE"
     lease_create_or_update "manual-timer" "timer" "$(current_default_mode)" "Manual timer active" 90 "" "cli"
-    reconcile_effective_state
 
     # Background timer
     (
@@ -2449,13 +2494,15 @@ cmd_for() {
             lease_remove "manual-timer"
             reconcile_effective_state
             if timer_claim_is_current "$token" "$timer_pid"; then
-                rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE"
+                rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE" "$FOR_PID_START_FILE"
             fi
             exit 0
         done
     ) &
     echo $! > "$FOR_PID_FILE"
+    process_start_signature "$!" > "$FOR_PID_START_FILE"
     disown
+    reconcile_effective_state
 
     echo "nosleep ON for ${mins}m, then Sleep OK. Cancel with: awake stop"
 }
@@ -2513,7 +2560,7 @@ cmd_run_command() {
         log "Command finished (exit $exit_code) — leaving restore to active awake session"
     else
         log "Command finished (exit $exit_code)"
-        rm -f "$CAFFEINE_PID_FILE" "$STATE_FILE"
+        rm -f "$STATE_FILE"
     fi
     return $exit_code
 }
@@ -2620,8 +2667,12 @@ CONF
 
     # 5. Patch Claude Code settings.json
     if claude_detected; then
-        install_claude_hooks
-        log "Claude Code hooks: installed"
+        if install_claude_hooks; then
+            log "Claude Code hooks: installed"
+        else
+            log "ERROR: Claude Code settings could not be updated"
+            return 1
+        fi
     else
         log "Claude Code: not installed (skipping)"
     fi
@@ -2633,8 +2684,12 @@ CONF
         if codex_notify_installed; then
             log "Codex notify: already configured"
         else
-            install_codex_notify
-            log "Codex notify: installed"
+            if install_codex_notify; then
+                log "Codex notify: installed"
+            else
+                log "ERROR: Codex config could not be updated"
+                return 1
+            fi
         fi
     else
         log "Codex: not installed (skipping)"

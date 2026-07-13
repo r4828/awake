@@ -10,12 +10,15 @@ PMSET_STATE_DIR="$TEST_ROOT/pmset"
 PMSET_LOG="$TEST_ROOT/pmset.log"
 TEST_HOME="$TEST_ROOT/home"
 AGENTS_STATE_FILE="$TEST_ROOT/agents-active"
+TEST_SHELL_PID="$BASHPID"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
-cleanup() {
+cleanup_test_root() {
+    [ "$BASHPID" = "$TEST_SHELL_PID" ] || return 0
     rm -rf "$TEST_ROOT"
 }
-trap cleanup EXIT
+trap cleanup_test_root EXIT
+trap 'echo "timer test failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 cat > "$STUB_BIN/sudo" <<'EOF'
 #!/bin/bash
@@ -204,10 +207,12 @@ setup_state() {
     STATE_FILE="$dir/awake-state"
     LAST_ACTIVE_FILE="$dir/awake-last-active"
     CAFFEINE_PID_FILE="$dir/awake-caffeinate.pid"
+    CAFFEINE_PID_START_FILE="$dir/awake-caffeinate-pid-start"
     FOR_PID_FILE="$dir/awake-for.pid"
     FOR_END_FILE="$dir/awake-for-end"
     FOR_TOKEN_FILE="$dir/awake-for-token"
     FOR_WAIT_FILE="$dir/awake-for-waiting"
+    FOR_PID_START_FILE="$dir/awake-for-pid-start"
     DISPLAY_SLEEP_FILE="$dir/awake-display-sleep"
     LEASES_DIR="$dir/leases"
     RULES_DIR="$dir/rules.d"
@@ -262,13 +267,15 @@ pmset_value() {
 }
 
 wait_for_timer_exit() {
-    local pid
-    pid="$(cat "$FOR_PID_FILE")"
-    for _ in $(seq 1 30); do
+    local pid attempt=0
+    pid="$(read_file_value "$FOR_PID_FILE" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 0
+    while [ "$attempt" -lt 30 ]; do
         if ! kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
+        attempt=$(( attempt + 1 ))
     done
     echo "timer process $pid did not exit" >&2
     exit 1
@@ -341,6 +348,30 @@ test_cancel_timer_command_clears_lease() {
     assert_equals "normal" "$(cat "$STATE_FILE")"
     [ ! -d "$LEASES_DIR/manual-timer" ]
     [ ! -f "$FOR_PID_FILE" ]
+}
+
+test_stale_timer_pid_never_kills_unrelated_process() {
+    setup_state stale-pid
+    sleep 30 &
+    local unrelated_pid=$!
+    printf '%s\n' "$unrelated_pid" > "$FOR_PID_FILE"
+    printf '%s\n' "stale process identity" > "$FOR_PID_START_FILE"
+    lease_create_or_update "manual-timer" "timer" "running" "Manual timer active" 90 "" "test"
+    cmd_cancel_timer >/dev/null
+    kill -0 "$unrelated_pid"
+    kill "$unrelated_pid"
+    wait "$unrelated_pid" 2>/dev/null || true
+}
+
+test_orphaned_timer_lease_is_recovered() {
+    setup_state orphaned-timer
+    printf '%s\n' "999999" > "$FOR_PID_FILE"
+    printf '%s\n' "missing process" > "$FOR_PID_START_FILE"
+    lease_create_or_update "manual-timer" "timer" "running" "Manual timer active" 90 "" "test"
+    reconcile_effective_state
+    [ ! -d "$LEASES_DIR/manual-timer" ]
+    [ ! -f "$FOR_PID_FILE" ]
+    assert_equals "normal" "$(cat "$STATE_FILE")"
 }
 
 test_timer_waits_until_agents_stop_before_restoring() {
@@ -416,6 +447,8 @@ test_timer_replaces_manual_awake_session
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
 test_cancel_timer_command_clears_lease
+test_stale_timer_pid_never_kills_unrelated_process
+test_orphaned_timer_lease_is_recovered
 test_timer_waits_until_agents_stop_before_restoring
 test_restore_without_baseline_falls_back
 test_settings_apply_inactive

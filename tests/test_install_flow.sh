@@ -98,6 +98,7 @@ chmod +x "$STUB_BIN"/*
 
 export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+export AWAKE_RUNTIME_DIR="$TEST_ROOT/runtime"
 
 touch "$TEST_HOME/.codex/config.toml"
 
@@ -124,5 +125,11 @@ rm -f "$TEST_HOME/.local/bin/awake-package.json" "$TEST_HOME/.local/bin/AwakeApp
 [ ! -e "$TEST_HOME/.config/awake/install-metadata.json" ]
 ! grep -Fq "awake-hook claude" "$TEST_HOME/.claude/settings.json"
 ! grep -Fq "awake-notify" "$TEST_HOME/.codex/config.toml"
+
+printf '%s\n' '{not valid json' > "$TEST_HOME/.claude/settings.json"
+if AWAKE_INSTALL_NO_OPEN=1 "$REPO_DIR/awake" install >/dev/null 2>&1; then
+    echo "install should fail when Claude settings are malformed" >&2
+    exit 1
+fi
 
 echo "install flow tests passed"

@@ -8,13 +8,14 @@ STUB_BIN="$TEST_ROOT/bin"
 STATE_ROOT="$TEST_ROOT/state"
 PMSET_STATE_DIR="$TEST_ROOT/pmset"
 TEST_HOME="$TEST_ROOT/home"
+TEST_SHELL_PID="$BASHPID"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.claude" "$TEST_HOME/.codex" "$TEST_HOME/.local/bin" "$TEST_HOME/.config/awake"
 
-cleanup() {
-    rm -rf /tmp/awake-leases /tmp/awake-daemon.lock /tmp/awake-state /tmp/awake-last-active /tmp/awake-caffeinate.pid /tmp/awake-for.pid /tmp/awake-for-end /tmp/awake-for-token /tmp/awake-why
+cleanup_test_root() {
+    [ "$BASHPID" = "$TEST_SHELL_PID" ] || return 0
     rm -rf "$TEST_ROOT"
 }
-trap cleanup EXIT
+trap cleanup_test_root EXIT
 
 cat > "$STUB_BIN/sudo" <<'EOF'
 #!/bin/bash
@@ -83,6 +84,7 @@ chmod +x "$STUB_BIN"/*
 
 export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+export AWAKE_RUNTIME_DIR="$TEST_ROOT/runtime"
 
 printf '{\n  "hooks": {}\n}\n' > "$TEST_HOME/.claude/settings.json"
 touch "$TEST_HOME/.codex/config.toml"
