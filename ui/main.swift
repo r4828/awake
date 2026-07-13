@@ -29,6 +29,7 @@ let STATE_FILE = "/tmp/awake-state"
 let PID_FILE = "/tmp/awake.pid"
 let FOR_PID_FILE = "/tmp/awake-for.pid"
 let FOR_END_FILE = "/tmp/awake-for-end"
+let FOR_WAIT_FILE = "/tmp/awake-for-waiting"
 let DISPLAY_SLEEP_FILE = "/tmp/awake-display-sleep"
 let LAUNCH_AGENT_PATH = NSString("~/Library/LaunchAgents/com.awake.daemon.plist").expandingTildeInPath
 let HOOK_STALE_SECONDS: TimeInterval = 120
@@ -1335,7 +1336,12 @@ func installLaunchAgent() -> Bool {
     do {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try plist.write(toFile: LAUNCH_AGENT_PATH, atomically: true, encoding: .utf8)
-        return true
+        let domain = "gui/\(getuid())"
+        _ = runCommandCapture("/bin/launchctl", ["bootout", domain + "/com.awake.daemon"], timeout: 10)
+        let (loaded, _, _) = runCommandCapture("/bin/launchctl", ["bootstrap", domain, LAUNCH_AGENT_PATH], timeout: 10)
+        guard loaded else { return false }
+        let (started, _, _) = runCommandCapture("/bin/launchctl", ["kickstart", "-k", domain + "/com.awake.daemon"], timeout: 10)
+        return started
     } catch {
         return false
     }
@@ -1343,6 +1349,8 @@ func installLaunchAgent() -> Bool {
 
 func removeLaunchAgent() -> Bool {
     do {
+        let domain = "gui/\(getuid())"
+        _ = runCommandCapture("/bin/launchctl", ["bootout", domain + "/com.awake.daemon"], timeout: 10)
         try FileManager.default.removeItem(atPath: LAUNCH_AGENT_PATH)
         return true
     } catch {
@@ -2021,7 +2029,7 @@ class AwakeViewModel: ObservableObject {
 
         if isTimer, let endStr = readFile(FOR_END_FILE), let endEpoch = Int(endStr) {
             let remaining = endEpoch - Int(Date().timeIntervalSince1970)
-            timerText = remaining > 0 ? formatDuration(remaining) : "expiring..."
+            timerText = remaining > 0 ? formatDuration(remaining) : (readFile(FOR_WAIT_FILE) == "agents" ? "waiting for agents" : "finishing")
         } else if isTimer {
             timerText = "active"
         } else {
@@ -2064,7 +2072,7 @@ class AwakeViewModel: ObservableObject {
         snap.isTimer = isTimer
         if isTimer, let endStr = readFile(FOR_END_FILE), let endEpoch = Int(endStr) {
             let remaining = endEpoch - Int(Date().timeIntervalSince1970)
-        snap.timerText = remaining > 0 ? formatDuration(remaining) + " left" : "expiring..."
+        snap.timerText = remaining > 0 ? formatDuration(remaining) + " left" : (readFile(FOR_WAIT_FILE) == "agents" ? "waiting for agents" : "finishing")
         } else if isTimer {
             snap.timerText = "active"
         }
@@ -3273,6 +3281,8 @@ struct ContentView: View {
                         }
                     ))
                     .labelsHidden()
+                    .accessibilityLabel("Keep Mac awake")
+                    .accessibilityValue(vm.isNosleep ? "On" : "Off")
                     .toggleStyle(.switch)
                     .tint(.green)
                     .disabled(vm.isBusy)
@@ -3338,9 +3348,10 @@ struct ContentView: View {
                     }
                 }
                 .labelsHidden()
+                .accessibilityLabel("Sleep timer duration")
                 .frame(width: 72)
 
-                Button("Start timer") { vm.awakeFor() }
+                Button(vm.timerActive ? "Replace timer" : "Start timer") { vm.awakeFor() }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(vm.isBusy)

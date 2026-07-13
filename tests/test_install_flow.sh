@@ -111,10 +111,18 @@ grep -Fq 'notify = "'"$TEST_HOME"'/.local/bin/awake-notify"' "$TEST_HOME/.codex/
 grep -Fq '"packageName": "awake-agent"' "$TEST_HOME/.config/awake/install-metadata.json"
 [ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake-package.json" ]
 [ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/ui/main.swift" ]
+[ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/ui/private-apis.h" ]
 
 rm -f "$TEST_HOME/.local/bin/awake-package.json" "$TEST_HOME/.local/bin/AwakeApp/main.swift"
 "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake" install >/dev/null
 [ -f "$TEST_HOME/.local/bin/awake-package.json" ]
 [ -f "$TEST_HOME/.local/bin/AwakeApp/main.swift" ]
+
+"$TEST_HOME/.local/bin/awake" uninstall >/dev/null
+[ ! -e "$TEST_HOME/.local/bin/awake" ]
+[ ! -e "$TEST_HOME/.local/bin/Awake.app" ]
+[ ! -e "$TEST_HOME/.config/awake/install-metadata.json" ]
+! grep -Fq "awake-hook claude" "$TEST_HOME/.claude/settings.json"
+! grep -Fq "awake-notify" "$TEST_HOME/.codex/config.toml"
 
 echo "install flow tests passed"

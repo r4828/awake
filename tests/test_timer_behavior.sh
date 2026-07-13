@@ -207,6 +207,7 @@ setup_state() {
     FOR_PID_FILE="$dir/awake-for.pid"
     FOR_END_FILE="$dir/awake-for-end"
     FOR_TOKEN_FILE="$dir/awake-for-token"
+    FOR_WAIT_FILE="$dir/awake-for-waiting"
     DISPLAY_SLEEP_FILE="$dir/awake-display-sleep"
     LEASES_DIR="$dir/leases"
     RULES_DIR="$dir/rules.d"
@@ -285,6 +286,18 @@ test_timer_restores_sleep_ok() {
     assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
     [ ! -f "$BASELINE_FILE" ]
     assert_not_contains "pmset sleepnow" "$PMSET_LOG"
+}
+
+test_timer_replaces_manual_awake_session() {
+    setup_state replaces-manual
+    set_agents_active 0
+    activate_nosleep
+    [ -d "$LEASES_DIR/manual-toggle" ]
+    cmd_for 1 >/dev/null
+    [ ! -d "$LEASES_DIR/manual-toggle" ]
+    wait_for_timer_exit
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
 }
 
 test_timer_stays_awake_when_agents_active() {
@@ -399,6 +412,7 @@ test_temp_json() {
 }
 
 test_timer_restores_sleep_ok
+test_timer_replaces_manual_awake_session
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
 test_cancel_timer_command_clears_lease

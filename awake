@@ -40,8 +40,11 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
 LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
+LOCAL_PRIVATE_HEADER_FILE="$LOCAL_APP_SRC_DIR/private-apis.h"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
+REPO_PRIVATE_HEADER_FILE="$SCRIPT_DIR/ui/private-apis.h"
 BUNDLED_APP_SRC_FILE="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/main.swift"
+BUNDLED_PRIVATE_HEADER_FILE="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/private-apis.h"
 LOCAL_PACKAGE_JSON="$LOCAL_BIN_DIR/awake-package.json"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
 MODE_FILE="$HOME/.config/awake/default-mode"
@@ -58,6 +61,7 @@ CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
 FOR_PID_FILE="/tmp/awake-for.pid"
 FOR_END_FILE="/tmp/awake-for-end"
 FOR_TOKEN_FILE="/tmp/awake-for-token"
+FOR_WAIT_FILE="/tmp/awake-for-waiting"
 DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
 WHY_FILE="/tmp/awake-why"
 BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
@@ -158,7 +162,7 @@ current_package_version() {
     fi
 
     local candidate
-    for candidate in $(package_json_candidate_paths); do
+    while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
         [ -f "$candidate" ] || continue
         /usr/bin/python3 - "$candidate" <<'PY'
@@ -178,7 +182,7 @@ PY
         if [ $? -eq 0 ]; then
             return 0
         fi
-    done
+    done < <(package_json_candidate_paths)
 
     local version_from_metadata
     version_from_metadata="$(install_metadata_field packageVersion 2>/dev/null || true)"
@@ -625,6 +629,11 @@ clear_manual_leases() {
     lease_remove "manual-toggle"
     lease_remove "manual-timer"
     lease_remove "run-command"
+    local dir
+    for dir in "$LEASES_DIR"/run-command-*; do
+        [ -d "$dir" ] || continue
+        rm -rf "$dir"
+    done
 }
 
 cancel_timer_session() {
@@ -632,7 +641,7 @@ cancel_timer_session() {
     if [ -f "$FOR_PID_FILE" ]; then
         kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
     fi
-    rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+    rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE"
 }
 
 rule_dir() {
@@ -1255,6 +1264,14 @@ rule_matches() {
 sync_rule_leases() {
     ensure_runtime_dirs
     local dir id mode reason priority
+    # Remove leases whose rule disappeared outside the CLI (for example after
+    # restoring a config backup or an interrupted edit).
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        id="${id#rule-}"
+        [ -d "$RULES_DIR/$id" ] || lease_remove "rule-$id"
+    done
     for dir in "$RULES_DIR"/*; do
         [ -d "$dir" ] || continue
         id="$(basename "$dir")"
@@ -1966,8 +1983,8 @@ cmd_daemon() {
             grace_start=0
             lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Detected active coding agents" 70 "" "daemon"
         else
-            lease_remove "daemon-agent"
             if [ "$(rule_lease_count)" -gt 0 ]; then
+                lease_remove "daemon-agent"
                 grace_start=0
                 reconcile_effective_state
                 sleep "$POLL_INTERVAL"
@@ -1978,6 +1995,9 @@ cmd_daemon() {
                 log "No agents — grace period ($(( GRACE_SECONDS / 60 ))m)"
                 notify "awake" "No agents detected. Sleeping in $(( GRACE_SECONDS / 60 )) min."
             fi
+
+            # Keep the daemon's lease alive for the advertised grace period.
+            lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Agent grace period" 70 "" "daemon"
 
             local elapsed=$(( $(now_epoch) - grace_start ))
             local remaining=$(( GRACE_SECONDS - elapsed ))
@@ -2390,11 +2410,10 @@ cmd_for() {
         return 1
     fi
 
-    # Kill previous for-timer
-    if [ -f "$FOR_PID_FILE" ]; then
-        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
-    fi
+    # A timer replaces the manual indefinite override. Without this, starting
+    # "Sleep in 15m" while Awake is already on can never restore Sleep OK.
+    lease_remove "manual-toggle"
+    cancel_timer_session
 
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
@@ -2420,6 +2439,7 @@ cmd_for() {
                     log "Timer expired but agents still running — waiting to restore Sleep OK"
                     notify "awake" "Timer expired, waiting for agents to stop before restoring Sleep OK."
                     waiting_for_agents=true
+                    printf '%s\n' "agents" > "$FOR_WAIT_FILE"
                 fi
                 sleep "$POLL_INTERVAL"
                 continue
@@ -2429,7 +2449,7 @@ cmd_for() {
             lease_remove "manual-timer"
             reconcile_effective_state
             if timer_claim_is_current "$token" "$timer_pid"; then
-                rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+                rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$FOR_WAIT_FILE"
             fi
             exit 0
         done
@@ -2467,19 +2487,27 @@ cmd_run_command() {
         return 1
     fi
 
-    lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli"
+    local run_lease_id="run-command-$$-$RANDOM"
+    local interrupted=false
+    lease_create_or_update "$run_lease_id" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli"
     reconcile_effective_state
     log "Running: $*"
+
+    trap 'interrupted=true' INT TERM HUP
 
     local exit_code=0
     local daemon_active=false
     "$@" || exit_code=$?
+    trap - INT TERM HUP
+    if $interrupted && [ "$exit_code" -eq 0 ]; then
+        exit_code=130
+    fi
 
     if active_daemon_pid >/dev/null 2>&1; then
         daemon_active=true
     fi
 
-    lease_remove "run-command"
+    lease_remove "$run_lease_id"
     reconcile_effective_state
     if timer_running || $daemon_active || [ "$(lease_count)" -gt 0 ]; then
         log "Command finished (exit $exit_code) — leaving restore to active awake session"
@@ -2521,6 +2549,11 @@ cmd_install() {
     elif [ -f "$BUNDLED_APP_SRC_FILE" ]; then
         mkdir -p "$LOCAL_APP_SRC_DIR"
         cp "$BUNDLED_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
+    fi
+    if [ -f "$REPO_PRIVATE_HEADER_FILE" ]; then
+        cp "$REPO_PRIVATE_HEADER_FILE" "$LOCAL_APP_SRC_DIR/private-apis.h"
+    elif [ -f "$BUNDLED_PRIVATE_HEADER_FILE" ]; then
+        cp "$BUNDLED_PRIVATE_HEADER_FILE" "$LOCAL_APP_SRC_DIR/private-apis.h"
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -Fxq "$LOCAL_BIN_DIR"; then
@@ -2576,7 +2609,10 @@ CONF
             log "Run: xcode-select --install"
         else
         log "Building Swift menu bar app..."
-        "$LOCAL_BIN_DIR/awake-build-ui"
+        if ! "$LOCAL_BIN_DIR/awake-build-ui"; then
+            log "ERROR: Awake.app could not be built"
+            return 1
+        fi
         fi
     else
         log "WARNING: $LOCAL_APP_SRC_FILE not found, skipping UI build"
@@ -2604,6 +2640,10 @@ CONF
         log "Codex: not installed (skipping)"
     fi
 
+    if [ ! -x "$LOCAL_BIN_DIR/awake" ] || [ ! -d "$LOCAL_BIN_DIR/Awake.app" ]; then
+        log "ERROR: installation did not produce the Awake CLI and app"
+        return 1
+    fi
     write_install_metadata
 
     if [ -d "$LOCAL_BIN_DIR/Awake.app" ]; then
@@ -2622,22 +2662,30 @@ CONF
 cmd_uninstall() {
     log "Removing hooks..."
 
+    # Restore normal power behavior before removing the command that owns it.
+    cmd_stop >/dev/null 2>&1 || true
+    cancel_timer_session
+    clear_manual_leases
+    restore_normal_sleep_settings
+
     local settings="$HOME/.claude/settings.json"
     if [ -f "$settings" ]; then
-        python3 -c "
+        /usr/bin/python3 - "$settings" <<'PY'
 import json
-with open('$settings') as f:
+import sys
+path = sys.argv[1]
+with open(path) as f:
     cfg = json.load(f)
 hooks = cfg.get('hooks', {})
 if 'PreToolUse' in hooks:
     hooks['PreToolUse'] = [h for h in hooks['PreToolUse'] if 'awake-hook' not in str(h)]
     if not hooks['PreToolUse']:
         del hooks['PreToolUse']
-with open('$settings', 'w') as f:
+with open(path, 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
 print('OK')
-"
+PY
         log "Claude Code hooks: removed"
     fi
 
@@ -2647,7 +2695,13 @@ print('OK')
         log "Codex notify: removed"
     fi
 
-    log "Done"
+    rm -rf "$LOCAL_BIN_DIR/Awake.app" "$LOCAL_APP_SRC_DIR"
+    rm -f "$LOCAL_BIN_DIR/awake" "$LOCAL_BIN_DIR/awake-build-ui" \
+        "$LOCAL_BIN_DIR/awake-build-icon" "$LOCAL_BIN_DIR/awake-hook" \
+        "$LOCAL_BIN_DIR/awake-notify" "$LOCAL_PACKAGE_JSON" \
+        "$INSTALL_METADATA_FILE" "$UPDATE_CACHE_FILE"
+
+    log "Done. Awake was removed and normal sleep was restored."
 }
 
 # --- Main ---
