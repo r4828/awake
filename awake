@@ -1201,7 +1201,7 @@ agent_summary() {
 }
 
 current_state() {
-    cat "$STATE_FILE" 2>/dev/null || echo "unknown"
+    cat "$STATE_FILE" 2>/dev/null || echo "normal"
 }
 
 on_ac_power() {
