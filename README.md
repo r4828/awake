@@ -121,6 +121,7 @@ When you run AI coding agents (Claude Code, Codex CLI, Aider, etc.) on a laptop,
 - Left-click toggles Awake on or off
 - Right-click opens the full panel
 - `Option+1` blacks out every connected display, hides the cursor, blocks local input, and turns off the MacBook keyboard backlight while the Mac keeps running
+- The first blackout pauses for five seconds to show the recovery shortcut; press `Option+1` again (or `Escape`) to show the screens
 - Panel includes hero state, timers, daemon controls, logs, rules, and setup guidance
 - Settings and power controls are available directly in the app
 
@@ -376,6 +377,8 @@ Interactions:
 - Right-click opens the main panel
 - `Ctrl+Shift+A` opens the panel directly
 - `Option+1` toggles a full-screen blackout across every connected display, hides the cursor, blocks local input, and drops the MacBook keyboard backlight to zero until you toggle it again
+- On first use, Awake shows “Press Option + 1 anytime to show your screens” for five seconds before completing the blackout
+- If the shortcut is ever missed, run `awake screens show` from a terminal to restart the menu app and restore dark displays safely
 
 The panel includes:
 - Hero state with the current effective wake mode
@@ -506,7 +509,7 @@ If it shows 0, something is resetting it. Check if another tool (Amphetamine, et
 ### Menu bar icon doesn't appear
 On MacBooks with a notch, the menu bar has limited space. If too many icons are present, macOS silently hides new ones. Try:
 - Quit other menu bar apps to free space
-- If your menu bar is crowded, use Awake's Dock icon, hotkeys, or menu bar control permissions to keep it easy to reopen
+- If your menu bar is crowded, use Awake's Dock icon or `Ctrl+Shift+A` to reopen the panel
 - The panel still works via `Ctrl+Shift+A` even without the icon, and `Option+1` still toggles blackout
 
 ### Orphaned caffeinate processes

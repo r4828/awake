@@ -2,7 +2,6 @@ import AppKit
 import SwiftUI
 import Combine
 import UserNotifications
-import ApplicationServices
 import IOKit.ps
 import Carbon
 
@@ -135,15 +134,6 @@ func appleScriptStringLiteral(_ value: String) -> String {
 
 func fourCharCode(_ string: String) -> OSType {
     string.utf8.reduce(0) { ($0 << 8) | OSType($1) }
-}
-
-func hasMenuBarControlAccess() -> Bool {
-    AXIsProcessTrusted()
-}
-
-func requestMenuBarControlAccessPrompt() {
-    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    _ = AXIsProcessTrustedWithOptions(options)
 }
 
 func pgrepCount(_ name: String) -> Int {
@@ -703,6 +693,32 @@ final class KeyboardBacklightBlackoutController {
         }
     }
 
+    func deactivateSynchronously() {
+        guard !snapshots.isEmpty else { return }
+        let pendingSnapshots = Array(snapshots.values)
+        snapshots.removeAll()
+        restoreGeneration += 1
+
+        guard let client = resolveClient() else { return }
+        for snapshot in pendingSnapshots {
+            prepareKeyboardForManualRestore(snapshot, using: client)
+            restoreBrightness(snapshot, using: client)
+            restoreAutomaticControls(snapshot, using: client)
+        }
+    }
+
+    func restoreSafeDefaults() {
+        guard let client = resolveClient() else { return }
+        for keyboardID in keyboardIDs(using: client) {
+            let brightness = client.brightness(forKeyboard: keyboardID)
+            if brightness <= 0.01 {
+                _ = client.setBrightness(0.5, fadeSpeed: 0, commit: true, forKeyboard: keyboardID)
+            }
+            _ = client.enableAutoBrightness(true, forKeyboard: keyboardID)
+            _ = client.suspendIdleDimming(false, forKeyboard: keyboardID)
+        }
+    }
+
     private func prepareKeyboardForManualRestore(_ snapshot: KeyboardBacklightSnapshot, using client: KeyboardBrightnessClient) {
         _ = client.enableAutoBrightness(false, forKeyboard: snapshot.keyboardID)
         _ = client.suspendIdleDimming(true, forKeyboard: snapshot.keyboardID)
@@ -753,6 +769,14 @@ final class HardwareBlackoutController {
             guard let displayID = displayIdentifier(screen) else { continue }
             guard snapshots[displayID] == nil else { continue }
 
+            // Keep the built-in MacBook panel recoverable. A black overlay gives
+            // the same blackout effect without relying on a private brightness
+            // restore call after the lid or display topology changes.
+            if CGDisplayIsBuiltin(displayID) != 0 {
+                snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .overlayOnly)
+                continue
+            }
+
             if let brightness = getAppleBrightness(displayID) {
                 _ = setAppleBrightness(displayID, value: 0)
                 snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .appleBrightness(brightness))
@@ -776,6 +800,18 @@ final class HardwareBlackoutController {
     }
 
     func deactivate(currentScreens: [NSScreen]) {
+        restoreDisplays(currentScreens: currentScreens)
+        snapshots.removeAll()
+        keyboardBacklightController.deactivate()
+    }
+
+    func deactivateSynchronously(currentScreens: [NSScreen]) {
+        restoreDisplays(currentScreens: currentScreens)
+        snapshots.removeAll()
+        keyboardBacklightController.deactivateSynchronously()
+    }
+
+    private func restoreDisplays(currentScreens: [NSScreen]) {
         refreshMatches(for: currentScreens)
         for (displayID, snapshot) in snapshots {
             switch snapshot.restoreMode {
@@ -789,8 +825,38 @@ final class HardwareBlackoutController {
                 break
             }
         }
-        snapshots.removeAll()
-        keyboardBacklightController.deactivate()
+    }
+
+    @discardableResult
+    func restoreDarkDisplaysToSafeBrightness(currentScreens: [NSScreen]) -> Bool {
+        refreshMatches(for: currentScreens)
+        var restoredAnyDisplay = false
+
+        for screen in currentScreens {
+            guard let displayID = displayIdentifier(screen) else { continue }
+
+            if let brightness = getAppleBrightness(displayID), brightness <= 0.01 {
+                restoredAnyDisplay = setAppleBrightness(displayID, value: 0.5) || restoredAnyDisplay
+                continue
+            }
+
+            guard let service = serviceMatches[displayID]?.service,
+                  let brightness = Arm64DDC.read(service: service, command: DDC_BRIGHTNESS_COMMAND),
+                  brightness.current == 0,
+                  brightness.max > 0 else { continue }
+            let safeBrightness = max(UInt16(1), brightness.max / 2)
+            restoredAnyDisplay = Arm64DDC.write(
+                service: service,
+                command: DDC_BRIGHTNESS_COMMAND,
+                value: safeBrightness
+            ) || restoredAnyDisplay
+        }
+
+        return restoredAnyDisplay
+    }
+
+    func restoreSafeKeyboardDefaults() {
+        keyboardBacklightController.restoreSafeDefaults()
     }
 
     private func refreshMatches(for screens: [NSScreen]) {
@@ -849,7 +915,37 @@ final class BlackoutContentView: NSView {
         return NSCursor(image: image, hotSpot: .zero)
     }()
 
+    private let hintLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "Press Option + 1 anytime to show your screens")
+        label.font = .systemFont(ofSize: 28, weight: .semibold)
+        label.textColor = .white
+        label.alignment = .center
+        label.maximumNumberOfLines = 2
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.isHidden = true
+        return label
+    }()
+
     override var acceptsFirstResponder: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addSubview(hintLabel)
+        NSLayoutConstraint.activate([
+            hintLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            hintLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            hintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 40),
+            hintLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -40),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setFirstUseHintVisible(_ visible: Bool) {
+        hintLabel.isHidden = !visible
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -878,11 +974,15 @@ final class BlackoutContentView: NSView {
 }
 
 final class ScreenBlackoutController {
+    private static let firstUseHintDefaultsKey = "awake.blackoutFirstUseHintShown"
     private var windows: [String: BlackoutWindow] = [:]
     private var screenObserver: NSObjectProtocol?
     private var cursorHidden = false
     private var hiddenDisplayIDs: Set<CGDirectDisplayID> = []
     private let hardwareBlackoutController = HardwareBlackoutController()
+    private var blackoutEngaged = false
+    private var firstUseHintPending = false
+    private var pendingActivationWorkItem: DispatchWorkItem?
 
     private(set) var isActive = false {
         didSet {
@@ -920,6 +1020,31 @@ final class ScreenBlackoutController {
         guard !isActive else { return }
         isActive = true
         rebuildWindows()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        if !UserDefaults.standard.bool(forKey: Self.firstUseHintDefaultsKey) {
+            firstUseHintPending = true
+            setFirstUseHintVisible(true)
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.engageBlackout()
+            }
+            pendingActivationWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
+            return
+        }
+
+        engageBlackout()
+    }
+
+    private func engageBlackout() {
+        guard isActive, !blackoutEngaged else { return }
+        pendingActivationWorkItem = nil
+        if firstUseHintPending {
+            UserDefaults.standard.set(true, forKey: Self.firstUseHintDefaultsKey)
+            firstUseHintPending = false
+        }
+        setFirstUseHintVisible(false)
+        blackoutEngaged = true
         hardwareBlackoutController.activate(for: NSScreen.screens)
         if !cursorHidden {
             NSCursor.hide()
@@ -933,9 +1058,13 @@ final class ScreenBlackoutController {
         }
     }
 
-    func deactivate() {
+    func deactivate(synchronously: Bool = false) {
         guard isActive else { return }
-        hardwareBlackoutController.deactivate(currentScreens: NSScreen.screens)
+        pendingActivationWorkItem?.cancel()
+        pendingActivationWorkItem = nil
+        firstUseHintPending = false
+        // Make the escape path visible immediately, even if a slow DDC display
+        // needs several attempts to restore its hardware brightness.
         for window in windows.values {
             window.orderOut(nil)
             window.close()
@@ -947,6 +1076,25 @@ final class ScreenBlackoutController {
         }
         unhideCursorOnDisplays()
         isActive = false
+        if blackoutEngaged {
+            blackoutEngaged = false
+            if synchronously {
+                hardwareBlackoutController.deactivateSynchronously(currentScreens: NSScreen.screens)
+            } else {
+                hardwareBlackoutController.deactivate(currentScreens: NSScreen.screens)
+            }
+        }
+    }
+
+    func forceShowScreens(synchronously: Bool = false, recoverOrphanedHardware: Bool = false) {
+        if isActive {
+            deactivate(synchronously: synchronously)
+        }
+        if recoverOrphanedHardware {
+            forceUnhideCursorOnCurrentDisplays()
+            _ = hardwareBlackoutController.restoreDarkDisplaysToSafeBrightness(currentScreens: NSScreen.screens)
+            hardwareBlackoutController.restoreSafeKeyboardDefaults()
+        }
     }
 
     private func rebuildIfNeeded() {
@@ -976,8 +1124,11 @@ final class ScreenBlackoutController {
             windows[screenID] = window
         }
 
-        hardwareBlackoutController.activate(for: screens)
-        hideCursorOnDisplays(screens)
+        if blackoutEngaged {
+            hardwareBlackoutController.activate(for: screens)
+            hideCursorOnDisplays(screens)
+        }
+        setFirstUseHintVisible(firstUseHintPending)
 
         if let frontWindow = preferredFrontWindow() {
             frontWindow.makeKeyAndOrderFront(nil)
@@ -993,6 +1144,12 @@ final class ScreenBlackoutController {
             }
         }
         return windows.values.first
+    }
+
+    private func setFirstUseHintVisible(_ visible: Bool) {
+        for window in windows.values {
+            (window.contentView as? BlackoutContentView)?.setFirstUseHintVisible(visible)
+        }
     }
 
     private func screenIdentifier(_ screen: NSScreen) -> String {
@@ -1020,6 +1177,18 @@ final class ScreenBlackoutController {
 
     private func unhideCursorOnDisplays() {
         for displayID in hiddenDisplayIDs {
+            CGDisplayShowCursor(displayID)
+        }
+        hiddenDisplayIDs.removeAll()
+    }
+
+    private func forceUnhideCursorOnCurrentDisplays() {
+        if cursorHidden {
+            NSCursor.unhide()
+            cursorHidden = false
+        }
+        for screen in NSScreen.screens {
+            guard let displayID = displayIdentifier(screen) else { continue }
             CGDisplayShowCursor(displayID)
         }
         hiddenDisplayIDs.removeAll()
@@ -1539,7 +1708,6 @@ class AwakeViewModel: ObservableObject {
     @Published var allowDisplaySleep: Bool = false
     @Published var isOnAC: Bool = true
     @Published var launchAgentInstalled: Bool = false
-    @Published var menuBarControlConfigured: Bool = hasMenuBarControlAccess()
     @Published var selectedSettingsSource: PowerSettingsSource = .battery
     @Published var availableSettingsSources: [PowerSettingsSource] = []
     @Published var effectivePowerSettings: [String: [String: Int]] = [:]
@@ -1622,7 +1790,6 @@ class AwakeViewModel: ObservableObject {
     init() {
         allowDisplaySleep = FileManager.default.fileExists(atPath: DISPLAY_SLEEP_FILE)
         launchAgentInstalled = isLaunchAgentInstalled()
-        menuBarControlConfigured = hasMenuBarControlAccess()
         isOnAC = PowerMonitor.isOnAC()
         blackoutActive = AppDelegate.shared?.isBlackoutActive ?? false
         loadCpuTemperatureHistory()
@@ -2046,8 +2213,6 @@ class AwakeViewModel: ObservableObject {
         if let setupSnapshot {
             applySetupSnapshot(setupSnapshot)
         }
-        menuBarControlConfigured = hasMenuBarControlAccess()
-
         onStateChange?(state)
 
         // Push cached snapshot for instant menu bar menu
@@ -2380,23 +2545,6 @@ class AwakeViewModel: ObservableObject {
         }
     }
 
-    func enableMenuBarControl() {
-        requestMenuBarControlAccessPrompt()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.menuBarControlConfigured = hasMenuBarControlAccess()
-            if self.menuBarControlConfigured {
-                self.addLog("Menu bar control access enabled", color: .green)
-                AppDelegate.shared?.promoteStatusItemToVisibleEdge(promptIfNeeded: false)
-            } else {
-                self.addLog("Menu bar control access still pending approval", color: .orange)
-            }
-        }
-    }
-
-    func promoteMenuBarIcon() {
-        AppDelegate.shared?.promoteStatusItemToVisibleEdge(promptIfNeeded: true)
-        addLog("Trying to move Awake icon toward the visible end of the menu bar", color: .blue)
-    }
 }
 
 // MARK: - Theme (clean light)
@@ -3565,12 +3713,6 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
-                    Button("Move top icon forward") {
-                        vm.promoteMenuBarIcon()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
                     Divider()
 
                     DisclosureGroup(isExpanded: $showPowerSettings) {
@@ -4071,7 +4213,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hasPositioned = false
     private var iconTimer: AnyCancellable?
     var cachedMenu = MenuSnapshot()
-    private var pendingPromotionWorkItem: DispatchWorkItem?
     private var statusItemHintPopover: NSPopover?
     private let hotKeyController = GlobalHotKeyController()
     private let blackoutController = ScreenBlackoutController()
@@ -4138,6 +4279,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             blackoutHotKeyEnabled: blackoutHotKeyRegistered
         )
 
+        if CommandLine.arguments.contains("--restore-screens") {
+            blackoutController.forceShowScreens(synchronously: true, recoverOrphanedHardware: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.blackoutController.forceShowScreens(synchronously: true, recoverOrphanedHardware: true)
+            }
+        }
+
         // Periodic icon + uptime refresh (every 30s — lightweight)
         iconTimer = Timer.publish(every: 30, on: .main, in: .common)
             .autoconnect()
@@ -4148,7 +4296,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshIcon()
             self?.showPanel()
         }
-        scheduleStatusItemPromotion()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        blackoutController.deactivate(synchronously: true)
     }
 
     private func installKeyboardMonitors(panelHotKeyEnabled: Bool, blackoutHotKeyEnabled: Bool) {
@@ -4184,7 +4335,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
             if blackoutController.isActive {
-                if !blackoutHotKeyEnabled, event.type == .keyDown, flags.contains(.option), event.keyCode == UInt16(kVK_ANSI_1) {
+                let isBlackoutToggle = event.type == .keyDown
+                    && flags.contains(.option)
+                    && event.keyCode == UInt16(kVK_ANSI_1)
+                let isEscape = event.type == .keyDown && event.keyCode == UInt16(kVK_Escape)
+                if isBlackoutToggle || isEscape {
                     DispatchQueue.main.async { self.toggleBlackout(nil) }
                     return nil
                 }
@@ -4247,6 +4402,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 runCommand(AWAKE_CMD, ["sleep"], timeout: 10)
             }
+        case "blackout", "screens":
+            let requestedState = (queryValue("state") ?? queryValue("action") ?? "toggle").lowercased()
+            DispatchQueue.main.async {
+                switch requestedState {
+                case "off", "show", "restore":
+                    self.blackoutController.forceShowScreens(synchronously: true)
+                case "on", "hide":
+                    if !self.blackoutController.isActive {
+                        self.panel.orderOut(nil)
+                        self.blackoutController.activate()
+                    }
+                default:
+                    self.blackoutController.toggle()
+                }
+                self.refreshIcon()
+            }
         default:
             break
         }
@@ -4259,95 +4430,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applyDockIconVisibility() {
         NSApp.setActivationPolicy(.regular)
-    }
-
-    func scheduleStatusItemPromotion() {
-        pendingPromotionWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.promoteStatusItemToVisibleEdge(promptIfNeeded: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                self?.promoteStatusItemToVisibleEdge(promptIfNeeded: false)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) { [weak self] in
-                self?.promoteStatusItemToVisibleEdge(promptIfNeeded: false)
-            }
-        }
-        pendingPromotionWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: workItem)
-    }
-
-    func promoteStatusItemToVisibleEdge(promptIfNeeded: Bool) {
-        guard let button = statusItem.button, let buttonWindow = button.window else { return }
-
-        guard hasMenuBarControlAccess() else {
-            if promptIfNeeded {
-                requestMenuBarControlAccessPrompt()
-            }
-            return
-        }
-
-        let buttonRect = button.convert(button.bounds, to: nil)
-        let screenRect = buttonWindow.convertToScreen(buttonRect)
-        let startPoint = CGPoint(x: screenRect.midX, y: screenRect.midY)
-
-        guard let screen = buttonWindow.screen ?? NSScreen.screens.first(where: { $0.frame.contains(startPoint) }) else {
-            return
-        }
-
-        let targetXs: [CGFloat] = [
-            screen.frame.maxX - 170,
-            screen.frame.maxX - 240,
-            screen.frame.maxX - 320
-        ]
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let source = CGEventSource(stateID: .hidSystemState) else { return }
-            let originalCursor = NSEvent.mouseLocation
-
-            func postMouse(_ type: CGEventType, point: CGPoint, flags: CGEventFlags) {
-                guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else {
-                    return
-                }
-                event.flags = flags
-                event.post(tap: .cghidEventTap)
-            }
-
-            func postKey(_ down: Bool) {
-                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: down) else { return }
-                event.flags = down ? .maskCommand : []
-                event.post(tap: .cghidEventTap)
-            }
-
-            for targetX in targetXs {
-                let endPoint = CGPoint(x: targetX, y: startPoint.y)
-                postKey(true)
-                usleep(12_000)
-                CGWarpMouseCursorPosition(startPoint)
-                usleep(12_000)
-                postMouse(.mouseMoved, point: startPoint, flags: .maskCommand)
-                postMouse(.leftMouseDown, point: startPoint, flags: .maskCommand)
-
-                let steps = 24
-                for step in 1...steps {
-                    let progress = CGFloat(step) / CGFloat(steps)
-                    let point = CGPoint(
-                        x: startPoint.x + ((endPoint.x - startPoint.x) * progress),
-                        y: startPoint.y
-                    )
-                    CGWarpMouseCursorPosition(point)
-                    postMouse(.leftMouseDragged, point: point, flags: .maskCommand)
-                    usleep(10_000)
-                }
-
-                CGWarpMouseCursorPosition(endPoint)
-                postMouse(.leftMouseUp, point: endPoint, flags: .maskCommand)
-                usleep(12_000)
-                postKey(false)
-                usleep(120_000)
-            }
-
-            CGWarpMouseCursorPosition(originalCursor)
-        }
     }
 
     // MARK: - Status Item Click Handler

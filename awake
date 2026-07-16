@@ -2736,6 +2736,58 @@ cmd_ui() {
     open "$app"
 }
 
+cmd_screens() {
+    local action="${1:-show}"
+    local app="$LOCAL_BIN_DIR/Awake.app"
+    if [ ! -d "$app" ]; then
+        log "ERROR: $app not found. Run: awake install"
+        return 1
+    fi
+
+    case "$action" in
+        show|restore|off)
+            # Ask the running app to restore its own snapshots before restarting.
+            # The signal fallback exists for older releases that do not understand
+            # the recovery URL, but we never launch a concurrent second instance.
+            open "awake://blackout?action=off" >/dev/null 2>&1 || true
+            sleep 0.2
+            osascript -e 'tell application id "com.awake.menubar" to quit' >/dev/null 2>&1 || true
+            local attempt=0
+            while pgrep -x AwakeUI >/dev/null 2>&1 && [ "$attempt" -lt 50 ]; do
+                sleep 0.1
+                attempt=$(( attempt + 1 ))
+            done
+            if pgrep -x AwakeUI >/dev/null 2>&1; then
+                pkill -TERM -x AwakeUI 2>/dev/null || true
+                attempt=0
+                while pgrep -x AwakeUI >/dev/null 2>&1 && [ "$attempt" -lt 50 ]; do
+                    sleep 0.1
+                    attempt=$(( attempt + 1 ))
+                done
+            fi
+            if pgrep -x AwakeUI >/dev/null 2>&1; then
+                log "ERROR: AwakeUI did not exit; refusing to launch another copy"
+                return 1
+            fi
+            if ! open -na "$app" --args --restore-screens; then
+                log "ERROR: failed to relaunch Awake for screen recovery"
+                return 1
+            fi
+            log "Screen restore requested"
+            ;;
+        blackout|hide|on)
+            open "awake://blackout?action=on"
+            ;;
+        toggle)
+            open "awake://blackout?action=toggle"
+            ;;
+        *)
+            echo "Usage: awake screens [show|blackout|toggle]"
+            return 1
+            ;;
+    esac
+}
+
 cmd_install() {
     local auto_open=true
     [ "${AWAKE_INSTALL_NO_OPEN:-0}" = "1" ] && auto_open=false
@@ -2919,6 +2971,7 @@ case "${1:-}" in
     cancel-timer) cmd_cancel_timer ;;
     run)        shift; cmd_run_command "$@" ;;
     ui)         cmd_ui ;;
+    screens)    shift; cmd_screens "$@" ;;
     install)    cmd_install ;;
     uninstall)  cmd_uninstall ;;
     _daemon)    cmd_daemon ;;
@@ -2926,6 +2979,6 @@ case "${1:-}" in
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

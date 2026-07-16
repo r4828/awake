@@ -29,5 +29,17 @@ if grep -Fq 'title: "Allow menu bar control"' "$APP_ROOT/Contents/Resources/ui/m
     echo "menu bar control permission should not appear in onboarding" >&2
     exit 1
 fi
+if grep -Eq 'CGWarpMouseCursorPosition|promoteStatusItemToVisibleEdge|scheduleStatusItemPromotion|Move top icon forward' "$APP_ROOT/Contents/Resources/ui/main.swift"; then
+    echo "menu bar icon automation should not control the pointer" >&2
+    exit 1
+fi
+grep -Fq 'awake.blackoutFirstUseHintShown' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'Press Option + 1 anytime to show your screens' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'UserDefaults.standard.set(true, forKey: Self.firstUseHintDefaultsKey)' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'CGDisplayIsBuiltin(displayID) != 0' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'func applicationWillTerminate' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'blackoutController.deactivate(synchronously: true)' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'forceShowScreens(synchronously: true)' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'event.keyCode == UInt16(kVK_Escape)' "$APP_ROOT/Contents/Resources/ui/main.swift"
 
 echo "build ui tests passed"
