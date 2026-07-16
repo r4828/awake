@@ -23,5 +23,11 @@ grep -Fq "<string>awake</string>" "$PLIST"
 grep -Fq "<string>$PACKAGE_VERSION</string>" "$PLIST"
 [ -f "$APP_ROOT/Contents/Resources/bin/awake-package.json" ]
 [ -f "$APP_ROOT/Contents/Resources/ui/main.swift" ]
+grep -Fq '<string>_daemon</string>' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq '<key>SuccessfulExit</key>' "$APP_ROOT/Contents/Resources/ui/main.swift"
+if grep -Fq 'title: "Allow menu bar control"' "$APP_ROOT/Contents/Resources/ui/main.swift"; then
+    echo "menu bar control permission should not appear in onboarding" >&2
+    exit 1
+fi
 
 echo "build ui tests passed"

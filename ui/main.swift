@@ -30,6 +30,7 @@ let PID_FILE = "/tmp/awake.pid"
 let FOR_PID_FILE = "/tmp/awake-for.pid"
 let FOR_END_FILE = "/tmp/awake-for-end"
 let DISPLAY_SLEEP_FILE = "/tmp/awake-display-sleep"
+let LAUNCH_AGENT_LABEL = "com.awake.daemon"
 let LAUNCH_AGENT_PATH = NSString("~/Library/LaunchAgents/com.awake.daemon.plist").expandingTildeInPath
 let HOOK_STALE_SECONDS: TimeInterval = 120
 let LOG_MAX_LINES = 200
@@ -1309,6 +1310,19 @@ func isLaunchAgentInstalled() -> Bool {
     FileManager.default.fileExists(atPath: LAUNCH_AGENT_PATH)
 }
 
+func launchAgentDomain() -> String {
+    "gui/\(getuid())"
+}
+
+func launchAgentTarget() -> String {
+    "\(launchAgentDomain())/\(LAUNCH_AGENT_LABEL)"
+}
+
+func awakeDaemonIsRunning() -> Bool {
+    let result = runCommandCapture(AWAKE_CMD, ["status", "--json"], timeout: 5)
+    return result.0 && result.1.contains("\"daemonRunning\":true")
+}
+
 func installLaunchAgent() -> Bool {
     let dir = NSString("~/Library/LaunchAgents").expandingTildeInPath
     let plist = """
@@ -1317,22 +1331,39 @@ func installLaunchAgent() -> Bool {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.awake.daemon</string>
+    <string>\(LAUNCH_AGENT_LABEL)</string>
     <key>ProgramArguments</key>
     <array>
         <string>\(AWAKE_CMD)</string>
-        <string>start</string>
+        <string>_daemon</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/awake.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/awake.log</string>
 </dict>
 </plist>
 """
     do {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try plist.write(toFile: LAUNCH_AGENT_PATH, atomically: true, encoding: .utf8)
+        _ = runLaunchCtl(["bootout", launchAgentTarget()])
+        _ = runCommandCapture(AWAKE_CMD, ["stop"], timeout: 20)
+        guard runLaunchCtl(["bootstrap", launchAgentDomain(), LAUNCH_AGENT_PATH]) else {
+            try? FileManager.default.removeItem(atPath: LAUNCH_AGENT_PATH)
+            return false
+        }
         return true
     } catch {
         return false
@@ -1340,8 +1371,13 @@ func installLaunchAgent() -> Bool {
 }
 
 func removeLaunchAgent() -> Bool {
+    let daemonWasRunning = awakeDaemonIsRunning()
+    _ = runLaunchCtl(["bootout", launchAgentTarget()])
     do {
         try FileManager.default.removeItem(atPath: LAUNCH_AGENT_PATH)
+        if daemonWasRunning {
+            _ = runCommandCapture(AWAKE_CMD, ["start"], timeout: 10)
+        }
         return true
     } catch {
         return false
@@ -2841,15 +2877,6 @@ struct ContentView: View {
                             .stroke(Color.blue.opacity(0.14), lineWidth: 1)
                     )
                 }
-
-                onboardingStep(
-                    title: "Allow menu bar control",
-                    detail: "Optional. Lets Awake try to move its own menu bar icon toward the visible end of the menu bar, similar to manually Command-dragging it.",
-                    status: vm.menuBarControlConfigured ? "Enabled" : "Optional Accessibility approval",
-                    ready: vm.menuBarControlConfigured,
-                    actionTitle: "Enable",
-                    action: vm.enableMenuBarControl
-                )
 
                 HStack(spacing: 10) {
                     Button(vm.sleepControlConfigured ? "Open Awake" : "Continue anyway") {

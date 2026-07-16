@@ -303,18 +303,29 @@ cat > ~/Library/LaunchAgents/com.awake.daemon.plist << 'EOF'
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOUR_USERNAME/.local/bin/awake</string>
-        <string>start</string>
+        <string>_daemon</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/awake.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/awake.log</string>
 </dict>
 </plist>
 EOF
 # Replace YOUR_USERNAME, then:
-launchctl load ~/Library/LaunchAgents/com.awake.daemon.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.awake.daemon.plist
 ```
+
+The LaunchAgent owns the foreground daemon process. It restarts Awake after a crash or `kill -9`, but leaves it stopped after a clean `awake stop`. On every launch, Awake reconciles its durable power baseline with the real `pmset` state before resuming agent detection.
 
 ## Uninstall
 

@@ -12,10 +12,10 @@ TEST_HOME="$TEST_ROOT/home"
 AGENTS_STATE_FILE="$TEST_ROOT/agents-active"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
-cleanup() {
+cleanup_test() {
     rm -rf "$TEST_ROOT"
 }
-trap cleanup EXIT
+trap cleanup_test EXIT
 
 cat > "$STUB_BIN/sudo" <<'EOF'
 #!/bin/bash
@@ -46,7 +46,7 @@ EOF
 
 cat > "$STUB_BIN/caffeinate" <<'EOF'
 #!/bin/bash
-sleep 30
+exec -a caffeinate sleep 30
 EOF
 
 cat > "$STUB_BIN/osascript" <<'EOF'
@@ -105,6 +105,10 @@ if [ "${1:-}" = "-g" ]; then
     echo "Currently in use:"
     echo " disablesleep $(cat "$state_dir/disablesleep")"
     exit 0
+fi
+
+if [ "${AWAKE_TEST_PMSET_FAIL_WRITE:-0}" = "1" ]; then
+    exit 42
 fi
 
 scope="${1:-}"
@@ -211,6 +215,7 @@ setup_state() {
     LEASES_DIR="$dir/leases"
     RULES_DIR="$dir/rules.d"
     BASELINE_FILE="$dir/power-baseline.json"
+    OVERRIDE_MARKER_FILE="$dir/power-override-active"
     MODE_FILE="$dir/default-mode"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
@@ -330,6 +335,24 @@ test_cancel_timer_command_clears_lease() {
     [ ! -f "$FOR_PID_FILE" ]
 }
 
+test_replacing_timer_publishes_new_owner_atomically() {
+    setup_state replace-timer
+    cmd_for 1 >/dev/null
+    local old_pid
+    old_pid="$(cat "$FOR_PID_FILE")"
+
+    cmd_for 1 >/dev/null
+    local new_pid owner_pid
+    new_pid="$(cat "$FOR_PID_FILE")"
+    owner_pid="$(cat "$LEASES_DIR/manual-timer/owner_pid")"
+
+    [ "$new_pid" != "$old_pid" ]
+    assert_equals "$new_pid" "$owner_pid"
+    [ -f "$LEASES_DIR/manual-timer/ready" ]
+    [ -d "$LEASES_DIR/manual-timer" ]
+    cmd_cancel_timer >/dev/null
+}
+
 test_timer_waits_until_agents_stop_before_restoring() {
     setup_state wait-for-agents
     set_agents_active 1
@@ -356,6 +379,204 @@ test_restore_without_baseline_falls_back() {
     restore_normal_sleep_settings
     assert_equals "normal" "$(cat "$STATE_FILE")"
     assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_restores_after_crashed_daemon() {
+    setup_state crash-recovery
+    activate_nosleep >/dev/null
+    assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ -f "$BASELINE_FILE" ]
+    [ -f "$OVERRIDE_MARKER_FILE" ]
+
+    lease_remove "manual-toggle"
+    lease_create_or_update "daemon-agent" "daemon" "presenting" "Detected active coding agents" 70 "" "daemon"
+    set_agents_active 0
+    recover_power_state_on_launch
+
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$BASELINE_FILE" ]
+    [ ! -f "$OVERRIDE_MARKER_FILE" ]
+    [ ! -d "$LEASES_DIR/daemon-agent" ]
+}
+
+test_reconcile_repairs_kernel_state_mismatch() {
+    setup_state kernel-mismatch
+    activate_nosleep >/dev/null
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+
+    echo "0" > "$PMSET_STATE_DIR/disablesleep"
+    reconcile_effective_state
+
+    assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    activate_yessleep
+}
+
+test_launch_recovery_leaves_unowned_kernel_setting_alone() {
+    setup_state unowned-kernel-setting
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    recover_power_state_on_launch
+
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$BASELINE_FILE" ]
+    [ ! -f "$OVERRIDE_MARKER_FILE" ]
+}
+
+test_failed_recovery_keeps_ownership_for_retry() {
+    setup_state recovery-retry
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    export AWAKE_TEST_PMSET_FAIL_WRITE=1
+
+    if recover_power_state_on_launch; then
+        echo "expected recovery to fail while pmset writes are blocked" >&2
+        exit 1
+    fi
+
+    [ -f "$BASELINE_FILE" ]
+    [ -f "$OVERRIDE_MARKER_FILE" ]
+    assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+
+    unset AWAKE_TEST_PMSET_FAIL_WRITE
+    recover_power_state_on_launch
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$BASELINE_FILE" ]
+    [ ! -f "$OVERRIDE_MARKER_FILE" ]
+}
+
+test_cleanup_failure_requests_supervisor_restart() {
+    setup_state cleanup-restart
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    lease_create_or_update "daemon-agent" "daemon" "presenting" "Detected active coding agents" 70 "" "daemon"
+    mkdir -p "$DAEMON_LOCK_DIR"
+    echo $$ > "$DAEMON_OWNER_FILE"
+    echo $$ > "$PID_FILE"
+
+    set +e
+    (export AWAKE_TEST_PMSET_FAIL_WRITE=1; daemon_signal_exit)
+    local cleanup_status=$?
+    set -e
+
+    assert_equals "1" "$cleanup_status"
+    [ -f "$BASELINE_FILE" ]
+    [ -f "$OVERRIDE_MARKER_FILE" ]
+
+    recover_power_state_on_launch
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_clean_signal_exit_does_not_request_restart() {
+    setup_state clean-signal-exit
+    mkdir -p "$DAEMON_LOCK_DIR"
+    echo $$ > "$DAEMON_OWNER_FILE"
+    echo $$ > "$PID_FILE"
+
+    set +e
+    (daemon_signal_exit)
+    local signal_status=$?
+    set -e
+
+    assert_equals "0" "$signal_status"
+    [ ! -f "$STATE_FILE" ]
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_prunes_stale_timer_lease() {
+    setup_state stale-timer-lease
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    lease_create_or_update "manual-timer" "timer" "presenting" "Stale timer" 90 "" "cli"
+
+    recover_power_state_on_launch
+
+    [ ! -d "$LEASES_DIR/manual-timer" ]
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_prunes_orphan_rule_lease() {
+    setup_state orphan-rule-lease
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    lease_create_or_update "rule-deleted-rule" "rule" "presenting" "Deleted rule" 60 "" "rule"
+
+    recover_power_state_on_launch
+
+    [ ! -d "$LEASES_DIR/rule-deleted-rule" ]
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_prunes_stale_command_lease() {
+    setup_state stale-command-lease
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    lease_create_or_update "run-command" "command" "presenting" "Dead command" 85 "" "cli"
+    echo 999999 > "$LEASES_DIR/run-command/owner_pid"
+
+    recover_power_state_on_launch
+
+    [ ! -d "$LEASES_DIR/run-command" ]
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_prunes_malformed_manual_lease() {
+    setup_state malformed-manual-lease
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    mkdir -p "$LEASES_DIR/manual-toggle"
+
+    recover_power_state_on_launch
+
+    [ ! -d "$LEASES_DIR/manual-toggle" ]
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_launch_recovery_ignores_unpublished_timer_process() {
+    setup_state unpublished-timer
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    sleep 30 &
+    local timer_pid=$!
+    echo "$timer_pid" > "$FOR_PID_FILE"
+    echo "pending-token" > "$FOR_TOKEN_FILE"
+    echo 9999999999 > "$FOR_END_FILE"
+
+    recover_power_state_on_launch
+
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    kill "$timer_pid" 2>/dev/null || true
+    rm -f "$FOR_PID_FILE" "$FOR_TOKEN_FILE" "$FOR_END_FILE"
+}
+
+test_launch_recovery_keeps_published_live_timer() {
+    setup_state published-timer
+    activate_nosleep >/dev/null
+    lease_remove "manual-toggle"
+    sleep 30 &
+    local timer_pid=$!
+    echo "$timer_pid" > "$FOR_PID_FILE"
+    echo "live-token" > "$FOR_TOKEN_FILE"
+    echo 9999999999 > "$FOR_END_FILE"
+    lease_create_or_update "manual-timer" "timer" "presenting" "Live timer" 90 "" "cli" "$timer_pid"
+
+    recover_power_state_on_launch
+
+    [ -d "$LEASES_DIR/manual-timer" ]
+    assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    cancel_timer_session
+    reconcile_effective_state
 }
 
 test_settings_apply_inactive() {
@@ -402,8 +623,21 @@ test_timer_restores_sleep_ok
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
 test_cancel_timer_command_clears_lease
+test_replacing_timer_publishes_new_owner_atomically
 test_timer_waits_until_agents_stop_before_restoring
 test_restore_without_baseline_falls_back
+test_launch_recovery_restores_after_crashed_daemon
+test_reconcile_repairs_kernel_state_mismatch
+test_launch_recovery_leaves_unowned_kernel_setting_alone
+test_failed_recovery_keeps_ownership_for_retry
+test_cleanup_failure_requests_supervisor_restart
+test_clean_signal_exit_does_not_request_restart
+test_launch_recovery_prunes_stale_timer_lease
+test_launch_recovery_prunes_orphan_rule_lease
+test_launch_recovery_prunes_stale_command_lease
+test_launch_recovery_prunes_malformed_manual_lease
+test_launch_recovery_ignores_unpublished_timer_process
+test_launch_recovery_keeps_published_live_timer
 test_settings_apply_inactive
 test_settings_apply_active_updates_baseline
 test_settings_dump_json

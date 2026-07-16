@@ -101,7 +101,7 @@ export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 
 touch "$TEST_HOME/.codex/config.toml"
 
-"$REPO_DIR/awake" install >/dev/null
+INSTALL_OUTPUT="$("$REPO_DIR/awake" install 2>&1)"
 
 [ -f "$TEST_HOME/.claude/settings.json" ]
 grep -Fq "awake-hook claude" "$TEST_HOME/.claude/settings.json"
@@ -109,7 +109,11 @@ grep -Fq 'notify = "'"$TEST_HOME"'/.local/bin/awake-notify"' "$TEST_HOME/.codex/
 [ -f "$TEST_HOME/.local/bin/awake-package.json" ]
 [ -f "$TEST_HOME/.config/awake/install-metadata.json" ]
 grep -Fq '"packageName": "awake-agent"' "$TEST_HOME/.config/awake/install-metadata.json"
-[ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake-package.json" ]
+[ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake-package.json" ] || {
+    printf '%s\n' "$INSTALL_OUTPUT" >&2
+    find "$TEST_HOME/.local/bin/Awake.app" -maxdepth 5 -type f -print >&2 || true
+    exit 1
+}
 [ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/ui/main.swift" ]
 
 rm -f "$TEST_HOME/.local/bin/awake-package.json" "$TEST_HOME/.local/bin/AwakeApp/main.swift"

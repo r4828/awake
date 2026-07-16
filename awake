@@ -40,10 +40,16 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
 LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
+LOCAL_APP_PRIVATE_HEADER="$LOCAL_APP_SRC_DIR/private-apis.h"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
+REPO_APP_PRIVATE_HEADER="$SCRIPT_DIR/ui/private-apis.h"
 BUNDLED_APP_SRC_FILE="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/main.swift"
+BUNDLED_APP_PRIVATE_HEADER="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/private-apis.h"
 LOCAL_PACKAGE_JSON="$LOCAL_BIN_DIR/awake-package.json"
+LAUNCH_AGENT_LABEL="com.awake.daemon"
+LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
+OVERRIDE_MARKER_FILE="$HOME/.config/awake/power-override-active"
 MODE_FILE="$HOME/.config/awake/default-mode"
 RULES_DIR="$HOME/.config/awake/rules.d"
 INSTALL_METADATA_FILE="$HOME/.config/awake/install-metadata.json"
@@ -75,6 +81,19 @@ now_epoch() { date +%s; }
 
 ensure_runtime_dirs() {
     mkdir -p "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
+}
+
+launch_agent_domain() {
+    printf 'gui/%s' "$(id -u)"
+}
+
+launch_agent_target() {
+    printf '%s/%s' "$(launch_agent_domain)" "$LAUNCH_AGENT_LABEL"
+}
+
+launch_agent_loaded() {
+    [ -f "$LAUNCH_AGENT_PATH" ] || return 1
+    /bin/launchctl print "$(launch_agent_target)" >/dev/null 2>&1
 }
 
 json_escape() {
@@ -519,13 +538,18 @@ lease_create_or_update() {
     local priority="$5"
     local expires_at="${6:-}"
     local source="${7:-}"
+    local owner_pid="${8:-}"
     ensure_runtime_dirs
-    local dir
+    local dir publish_dir="" started_at
     dir="$(lease_dir "$id")"
-    mkdir -p "$dir"
-    if [ ! -f "$dir/started_at" ]; then
-        echo "$(now_epoch)" > "$dir/started_at"
+    if [ -d "$dir" ]; then
+        started_at="$(lease_field "$id" started_at 2>/dev/null || now_epoch)"
+    else
+        publish_dir="$(mktemp -d "$LEASES_DIR/.${id}.tmp.XXXXXX")" || return 1
+        dir="$publish_dir"
+        started_at="$(now_epoch)"
     fi
+    printf '%s' "$started_at" > "$dir/started_at"
     printf '%s' "$id" > "$dir/id"
     printf '%s' "$type" > "$dir/type"
     printf '%s' "$mode" > "$dir/mode"
@@ -533,6 +557,15 @@ lease_create_or_update() {
     printf '%s' "$priority" > "$dir/priority"
     printf '%s' "$source" > "$dir/source"
     printf '%s' "${expires_at:-}" > "$dir/expires_at"
+    if [ -n "$owner_pid" ]; then
+        printf '%s' "$owner_pid" > "$dir/owner_pid"
+    else
+        rm -f "$dir/owner_pid"
+    fi
+    printf '%s' "1" > "$dir/ready"
+    if [ -n "$publish_dir" ]; then
+        mv "$publish_dir" "$(lease_dir "$id")"
+    fi
 }
 
 lease_remove() {
@@ -546,6 +579,25 @@ lease_has_expired() {
     [ -n "$expires_at" ] || return 1
     [ "$expires_at" -gt 0 ] 2>/dev/null || return 1
     [ "$(now_epoch)" -ge "$expires_at" ]
+}
+
+lease_is_well_formed() {
+    local id="$1" dir type mode priority started recorded_id
+    dir="$(lease_dir "$id")"
+    [ -d "$dir" ] || return 1
+    for field in id type mode reason priority started_at source expires_at; do
+        [ -f "$dir/$field" ] || return 1
+    done
+    recorded_id="$(lease_field "$id" id 2>/dev/null || true)"
+    type="$(lease_field "$id" type 2>/dev/null || true)"
+    mode="$(lease_field "$id" mode 2>/dev/null || true)"
+    priority="$(lease_field "$id" priority 2>/dev/null || true)"
+    started="$(lease_field "$id" started_at 2>/dev/null || true)"
+    [ "$recorded_id" = "$id" ] || return 1
+    case "$type" in manual|timer|command|daemon|rule) ;; *) return 1 ;; esac
+    case "$mode" in running|presenting|agent-safe) ;; *) return 1 ;; esac
+    [[ "$priority" =~ ^-?[0-9]+$ ]] || return 1
+    [[ "$started" =~ ^[0-9]+$ ]] || return 1
 }
 
 cleanup_expired_leases() {
@@ -663,11 +715,12 @@ pid_is_alive() {
 
 wait_for_pid_exit() {
     local pid="${1:-}"
-    local _attempt
+    local _attempt=0
     [ -n "$pid" ] || return 0
-    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    while [ "$_attempt" -lt 100 ]; do
         pid_is_alive "$pid" || return 0
-        sleep 0.05
+        sleep 0.1
+        _attempt=$(( _attempt + 1 ))
     done
     return 1
 }
@@ -1278,7 +1331,13 @@ rule_matches() {
 
 sync_rule_leases() {
     ensure_runtime_dirs
-    local dir id mode reason priority
+    local dir id mode reason priority rule_id
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        rule_id="$(basename "$dir")"
+        rule_id="${rule_id#rule-}"
+        [ -d "$(rule_dir "$rule_id")" ] || rm -rf "$dir"
+    done
     for dir in "$RULES_DIR"/*; do
         [ -d "$dir" ] || continue
         id="$(basename "$dir")"
@@ -1626,7 +1685,38 @@ restore_baseline_snapshot() {
 }
 
 restore_fallback_sleep_settings() {
-    sudo -n pmset -a disablesleep 0 sleep 10 displaysleep 10 standby 1 hibernatemode 3 2>/dev/null || true
+    sudo -n pmset -a disablesleep 0 sleep 10 displaysleep 10 standby 1 hibernatemode 3 2>/dev/null
+}
+
+current_disablesleep_value() {
+    pmset -g 2>/dev/null | awk '$1 == "disablesleep" { print $2; exit }'
+}
+
+mark_power_override_active() {
+    local marker_tmp
+    mkdir -p "$(dirname "$OVERRIDE_MARKER_FILE")"
+    marker_tmp="${OVERRIDE_MARKER_FILE}.tmp.$$"
+    printf '%s\n' "$(now_epoch)" > "$marker_tmp"
+    mv "$marker_tmp" "$OVERRIDE_MARKER_FILE"
+}
+
+caffeinate_process_running() {
+    local pid command
+    pid="$(read_file_value "$CAFFEINE_PID_FILE" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 1
+    pid_is_alive "$pid" || return 1
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command" in
+        *caffeinate*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+stop_owned_caffeinate() {
+    if caffeinate_process_running; then
+        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+    fi
+    rm -f "$CAFFEINE_PID_FILE"
 }
 
 baseline_setting_value() {
@@ -1648,38 +1738,45 @@ settings_update_baseline() {
 }
 
 restore_normal_sleep_settings() {
-    if [ "$(current_state)" = "normal" ] && [ ! -f "$CAFFEINE_PID_FILE" ] && [ ! -f "$BASELINE_FILE" ]; then
+    local state kernel_value
+    state="$(current_state)"
+    kernel_value="$(current_disablesleep_value 2>/dev/null || true)"
+    if [[ "$state" != nosleep* ]] && [ ! -f "$CAFFEINE_PID_FILE" ] && [ ! -f "$BASELINE_FILE" ] && [ ! -f "$OVERRIDE_MARKER_FILE" ]; then
+        if [ "$kernel_value" = "1" ]; then
+            log "WARNING: disablesleep=1 is active but Awake has no ownership record; leaving the user setting unchanged"
+        fi
+        echo "normal" > "$STATE_FILE"
         rm -f "$WHY_FILE"
         return 0
     fi
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-        rm -f "$CAFFEINE_PID_FILE"
-    fi
+    stop_owned_caffeinate
     if ! restore_baseline_snapshot; then
-        restore_fallback_sleep_settings
+        if ! restore_fallback_sleep_settings; then
+            log "ERROR: failed to restore normal sleep settings; recovery will retry on the next reconciliation"
+            return 1
+        fi
     fi
     echo "normal" > "$STATE_FILE"
-    rm -f "$WHY_FILE"
+    rm -f "$WHY_FILE" "$OVERRIDE_MARKER_FILE"
 }
 
 apply_presenting_mode() {
     local cs=$(current_state)
-    if [ "$cs" = "nosleep-full" ] || [ "$cs" = "nosleep" ]; then
+    if { [ "$cs" = "nosleep-full" ] || [ "$cs" = "nosleep" ]; } &&
+        [ "$(current_disablesleep_value 2>/dev/null || true)" = "1" ] &&
+        caffeinate_process_running; then
         # Migrate old format
         [ "$cs" = "nosleep" ] && echo "nosleep-full" > "$STATE_FILE"
         return 0
     fi
     log "Activating nosleep (full)"
     ensure_baseline_snapshot
+    mark_power_override_active
     sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 displaysleep 0 2>/dev/null || {
         log "ERROR: sudo pmset failed. Run: awake install"
         return 1
     }
-    # Kill only the caffeinate process Awake currently owns.
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-    fi
+    stop_owned_caffeinate
     caffeinate -disu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
     echo "nosleep-full" > "$STATE_FILE"
@@ -1687,11 +1784,14 @@ apply_presenting_mode() {
 
 apply_running_mode() {
     local cs=$(current_state)
-    if [ "$cs" = "nosleep-display" ]; then
+    if [ "$cs" = "nosleep-display" ] &&
+        [ "$(current_disablesleep_value 2>/dev/null || true)" = "1" ] &&
+        caffeinate_process_running; then
         return 0
     fi
     log "Activating nosleep (display sleep allowed)"
     ensure_baseline_snapshot
+    mark_power_override_active
     sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 2>/dev/null || {
         log "ERROR: sudo pmset failed. Run: awake install"
         return 1
@@ -1702,10 +1802,7 @@ apply_running_mode() {
     ac_display="$(baseline_setting_value ac displaysleep)"
     [ -n "$battery_display" ] && sudo -n pmset -b displaysleep "$battery_display" 2>/dev/null || true
     [ -n "$ac_display" ] && sudo -n pmset -c displaysleep "$ac_display" 2>/dev/null || true
-    # Kill only the caffeinate process Awake currently owns.
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-    fi
+    stop_owned_caffeinate
     caffeinate -isu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
     echo "nosleep-display" > "$STATE_FILE"
@@ -1719,7 +1816,7 @@ reconcile_effective_state() {
     if [ -z "$id" ]; then
         clear_battery_guard_state
         restore_normal_sleep_settings
-        return 0
+        return $?
     fi
     if enforce_battery_guard; then
         return 0
@@ -1733,6 +1830,60 @@ reconcile_effective_state() {
         presenting) apply_presenting_mode ;;
         *) apply_presenting_mode ;;
     esac
+}
+
+recover_power_state_on_launch() {
+    cleanup_expired_leases
+    lease_remove "daemon-agent"
+    sync_rule_leases
+
+    local dir id type owner rule_id
+    for dir in "$LEASES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        if ! lease_is_well_formed "$id"; then
+            log "Removing malformed lease: $id"
+            lease_remove "$id"
+            continue
+        fi
+        type="$(lease_field "$id" type 2>/dev/null || true)"
+        case "$type:$id" in
+            manual:manual-toggle)
+                ;;
+            timer:manual-timer)
+                owner="$(lease_field "$id" owner_pid 2>/dev/null || true)"
+                if ! timer_running || [ "$owner" != "$(read_file_value "$FOR_PID_FILE" 2>/dev/null || true)" ] || [ ! -f "$FOR_TOKEN_FILE" ] || [ ! -f "$FOR_END_FILE" ]; then
+                    log "Removing stale timer lease"
+                    lease_remove "$id"
+                    rm -f "$FOR_PID_FILE" "$FOR_TOKEN_FILE" "$FOR_END_FILE"
+                fi
+                ;;
+            command:run-command)
+                owner="$(lease_field "$id" owner_pid 2>/dev/null || true)"
+                if ! pid_is_alive "$owner"; then
+                    log "Removing stale command lease"
+                    lease_remove "$id"
+                fi
+                ;;
+            rule:rule-*)
+                rule_id="${id#rule-}"
+                [ -d "$(rule_dir "$rule_id")" ] || lease_remove "$id"
+                ;;
+            *)
+                log "Removing unknown lease: $id"
+                lease_remove "$id"
+                ;;
+        esac
+    done
+
+    if agents_running || [ "$(lease_count)" -gt 0 ]; then
+        return 0
+    fi
+
+    if [ -f "$BASELINE_FILE" ] || [ -f "$OVERRIDE_MARKER_FILE" ] || [[ "$(current_state)" == nosleep* ]]; then
+        log "Recovering stale Awake power override"
+    fi
+    restore_normal_sleep_settings
 }
 
 activate_nosleep() {
@@ -1801,9 +1952,19 @@ cleanup() {
         [ -d "$dir" ] || continue
         rm -rf "$dir"
     done
-    reconcile_effective_state
+    local recovery_status=0
+    reconcile_effective_state || recovery_status=$?
     rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$WHY_FILE"
     release_daemon_lock
+    return "$recovery_status"
+}
+
+daemon_signal_exit() {
+    trap - EXIT INT TERM
+    if cleanup; then
+        exit 0
+    fi
+    exit 1
 }
 
 parse_duration() {
@@ -1966,6 +2127,16 @@ cmd_daemon_start() {
         return 1
     fi
 
+    if launch_agent_loaded; then
+        log "Starting supervised daemon..."
+        /bin/launchctl kickstart -k "$(launch_agent_target)" || {
+            log "ERROR: launchd could not start $LAUNCH_AGENT_LABEL"
+            return 1
+        }
+        log "Daemon handed to launchd — log: /tmp/awake.log"
+        return 0
+    fi
+
     if $background; then
         log "Starting in background..."
         nohup "$0" _daemon </dev/null >>/tmp/awake.log 2>&1 &
@@ -1978,7 +2149,8 @@ cmd_daemon_start() {
 }
 
 cmd_daemon() {
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap daemon_signal_exit INT TERM
     ensure_runtime_dirs
     if ! acquire_daemon_lock; then
         log "Another awake daemon is already running"
@@ -1987,6 +2159,8 @@ cmd_daemon() {
     echo $$ > "$PID_FILE"
     log "Daemon started (PID $$, poll=${POLL_INTERVAL}s, grace=${GRACE_SECONDS}s)"
     log "Watching: $AGENTS"
+
+    recover_power_state_on_launch
 
     local grace_start=0
 
@@ -2070,7 +2244,7 @@ cmd_stop() {
     current_pid="$(active_daemon_pid 2>/dev/null || true)"
     if [ -n "$current_pid" ] && [ "$current_pid" != "$pid" ]; then
         log "Another daemon is already running (PID $current_pid); skipping restore"
-        return 0
+        return 1
     fi
 
     clear_manual_leases
@@ -2436,6 +2610,7 @@ cmd_for() {
         kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
         rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
     fi
+    lease_remove "manual-timer"
 
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
@@ -2447,13 +2622,23 @@ cmd_for() {
     # Write end time so UI can show countdown
     echo "$end_epoch" > "$FOR_END_FILE"
     echo "$token" > "$FOR_TOKEN_FILE"
-    lease_create_or_update "manual-timer" "timer" "$(current_default_mode)" "Manual timer active" 90 "" "cli"
-    reconcile_effective_state
 
-    # Background timer
+    # Start the timer behind a publication handshake. The process waits until
+    # its PID and complete lease are visible before it begins the countdown.
     (
         local timer_pid="$BASHPID"
         local waiting_for_agents=false
+        local publish_attempt=0
+        while [ "$publish_attempt" -lt 500 ]; do
+            if timer_claim_is_current "$token" "$timer_pid" && lease_exists "manual-timer"; then
+                break
+            fi
+            sleep 0.01
+            publish_attempt=$(( publish_attempt + 1 ))
+        done
+        if ! timer_claim_is_current "$token" "$timer_pid" || ! lease_exists "manual-timer"; then
+            exit 1
+        fi
         sleep "$secs"
         while timer_claim_is_current "$token" "$timer_pid"; do
             if agents_running; then
@@ -2475,8 +2660,18 @@ cmd_for() {
             exit 0
         done
     ) &
-    echo $! > "$FOR_PID_FILE"
-    disown
+    local timer_pid=$!
+    echo "$timer_pid" > "$FOR_PID_FILE"
+    if ! lease_create_or_update "manual-timer" "timer" "$(current_default_mode)" "Manual timer active" 90 "" "cli" "$timer_pid"; then
+        kill "$timer_pid" 2>/dev/null || true
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+        return 1
+    fi
+    if ! reconcile_effective_state; then
+        cancel_timer_session
+        return 1
+    fi
+    disown "$timer_pid" 2>/dev/null || true
 
     echo "nosleep ON for ${mins}m, then Sleep OK. Cancel with: awake stop"
 }
@@ -2508,7 +2703,7 @@ cmd_run_command() {
         return 1
     fi
 
-    lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli"
+    lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli" "$$"
     reconcile_effective_state
     log "Running: $*"
 
@@ -2559,9 +2754,11 @@ cmd_install() {
     copy_if_present "$SCRIPT_DIR/package.json" "$LOCAL_PACKAGE_JSON" || true
     if [ -f "$REPO_APP_SRC_FILE" ]; then
         cp "$REPO_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
+        copy_if_present "$REPO_APP_PRIVATE_HEADER" "$LOCAL_APP_PRIVATE_HEADER" || true
     elif [ -f "$BUNDLED_APP_SRC_FILE" ]; then
         mkdir -p "$LOCAL_APP_SRC_DIR"
         cp "$BUNDLED_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
+        copy_if_present "$BUNDLED_APP_PRIVATE_HEADER" "$LOCAL_APP_PRIVATE_HEADER" || true
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -Fxq "$LOCAL_BIN_DIR"; then
@@ -2617,7 +2814,10 @@ CONF
             log "Run: xcode-select --install"
         else
         log "Building Swift menu bar app..."
-        "$LOCAL_BIN_DIR/awake-build-ui"
+        if ! "$LOCAL_BIN_DIR/awake-build-ui"; then
+            log "ERROR: failed to build the native menu bar app"
+            return 1
+        fi
         fi
     else
         log "WARNING: $LOCAL_APP_SRC_FILE not found, skipping UI build"
@@ -2661,6 +2861,12 @@ CONF
 }
 
 cmd_uninstall() {
+    if launch_agent_loaded; then
+        /bin/launchctl bootout "$(launch_agent_target)" >/dev/null 2>&1 || true
+    fi
+    rm -f "$LAUNCH_AGENT_PATH"
+    cmd_stop >/dev/null 2>&1 || true
+
     log "Removing hooks..."
 
     local settings="$HOME/.claude/settings.json"
