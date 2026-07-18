@@ -171,8 +171,9 @@ log() {
     :
 }
 
+NOTIFY_LOG=/dev/null
 notify() {
-    :
+    printf '%s\n' "$*" >> "$NOTIFY_LOG"
 }
 
 set_agents_active() {
@@ -220,6 +221,9 @@ setup_state() {
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
     WHY_FILE="$dir/awake-why"
+    UNOWNED_NOTIFY_FILE="$dir/awake-unowned-notified"
+    NOTIFY_LOG="$dir/notify.log"
+    : > "$NOTIFY_LOG"
     : > "$PMSET_LOG"
     set_agents_active 0
     rm -f /tmp/awake-claude-* /tmp/awake-codex-* 2>/dev/null || true
@@ -426,6 +430,91 @@ test_launch_recovery_leaves_unowned_kernel_setting_alone() {
     [ ! -f "$OVERRIDE_MARKER_FILE" ]
 }
 
+test_unowned_disablesleep_warns_without_clobbering() {
+    setup_state unowned-warn
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    restore_normal_sleep_settings
+
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_contains "awake fix" "$WHY_FILE"
+    assert_contains "disablesleep" "$NOTIFY_LOG"
+}
+
+test_unowned_disablesleep_notifies_only_once() {
+    setup_state unowned-once
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    restore_normal_sleep_settings
+    restore_normal_sleep_settings
+    restore_normal_sleep_settings
+
+    assert_equals "1" "$(grep -c . "$NOTIFY_LOG")"
+}
+
+test_warnings_report_unowned_disablesleep() {
+    setup_state unowned-warnings-json
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    assert_contains "awake fix" <(warnings_json)
+}
+
+test_why_reports_unowned_disablesleep() {
+    setup_state why-unowned
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    assert_contains "awake fix" <(why_summary)
+}
+
+test_fix_clears_unowned_disablesleep() {
+    setup_state fix-unowned
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+    printf 'stale\n' > "$WHY_FILE"
+    : > "$UNOWNED_NOTIFY_FILE"
+
+    cmd_fix >/dev/null
+
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$WHY_FILE" ]
+    [ ! -f "$UNOWNED_NOTIFY_FILE" ]
+}
+
+test_fix_is_noop_when_nothing_unowned() {
+    setup_state fix-noop
+
+    local out
+    out="$(cmd_fix)"
+
+    [[ "$out" == *"Nothing to fix"* ]]
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_owned_restore_clears_unowned_notice() {
+    setup_state owned-clears
+    activate_nosleep >/dev/null
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    : > "$UNOWNED_NOTIFY_FILE"
+
+    activate_yessleep
+
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$UNOWNED_NOTIFY_FILE" ]
+}
+
+test_fix_leaves_awake_owned_session_alone() {
+    setup_state fix-owned
+    activate_nosleep >/dev/null
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+
+    local out
+    out="$(cmd_fix)"
+
+    [[ "$out" == *"Nothing to fix"* ]]
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    activate_yessleep
+}
+
 test_failed_recovery_keeps_ownership_for_retry() {
     setup_state recovery-retry
     activate_nosleep >/dev/null
@@ -629,6 +718,14 @@ test_restore_without_baseline_falls_back
 test_launch_recovery_restores_after_crashed_daemon
 test_reconcile_repairs_kernel_state_mismatch
 test_launch_recovery_leaves_unowned_kernel_setting_alone
+test_unowned_disablesleep_warns_without_clobbering
+test_unowned_disablesleep_notifies_only_once
+test_warnings_report_unowned_disablesleep
+test_why_reports_unowned_disablesleep
+test_fix_clears_unowned_disablesleep
+test_fix_is_noop_when_nothing_unowned
+test_owned_restore_clears_unowned_notice
+test_fix_leaves_awake_owned_session_alone
 test_failed_recovery_keeps_ownership_for_retry
 test_cleanup_failure_requests_supervisor_restart
 test_clean_signal_exit_does_not_request_restart

@@ -66,6 +66,7 @@ FOR_END_FILE="/tmp/awake-for-end"
 FOR_TOKEN_FILE="/tmp/awake-for-token"
 DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
 WHY_FILE="/tmp/awake-why"
+UNOWNED_NOTIFY_FILE="/tmp/awake-unowned-notified"
 BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
 LOG_PREFIX="[awake]"
 PACKAGE_NAME="awake-agent"
@@ -1272,6 +1273,10 @@ why_summary() {
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
+        if unowned_disablesleep_active; then
+            echo "disablesleep is on but Awake did not set it. Run 'awake fix' to clear it."
+            return 0
+        fi
         echo "Normal sleep. No active leases."
         return 0
     fi
@@ -1423,6 +1428,9 @@ warnings_json() {
     fi
     if [ "$(lease_count)" -eq 0 ] && ! timer_running && [ -z "$(active_daemon_pid 2>/dev/null || true)" ] && [[ "$(current_state)" == nosleep* ]]; then
         warnings+=("Nosleep state appears stale: no active leases are holding the machine awake")
+    fi
+    if unowned_disablesleep_active; then
+        warnings+=("disablesleep is on but Awake did not set it; run 'awake fix' to clear it")
     fi
     if [ ${#warnings[@]} -eq 0 ]; then
         printf '[]'
@@ -1737,6 +1745,21 @@ settings_update_baseline() {
     python_settings_tool baseline-set "$source" "$@" >/dev/null
 }
 
+unowned_disablesleep_active() {
+    [ "$(current_disablesleep_value 2>/dev/null || true)" = "1" ] &&
+        [[ "$(current_state)" != nosleep* ]] &&
+        [ ! -f "$CAFFEINE_PID_FILE" ] &&
+        [ ! -f "$BASELINE_FILE" ] &&
+        [ ! -f "$OVERRIDE_MARKER_FILE" ]
+}
+
+notify_unowned_disablesleep_once() {
+    if ! (set -C; : > "$UNOWNED_NOTIFY_FILE") 2>/dev/null; then
+        return 0
+    fi
+    notify "awake" "disablesleep is on but Awake did not set it. Run 'awake fix' to clear it."
+}
+
 restore_normal_sleep_settings() {
     local state kernel_value
     state="$(current_state)"
@@ -1744,9 +1767,12 @@ restore_normal_sleep_settings() {
     if [[ "$state" != nosleep* ]] && [ ! -f "$CAFFEINE_PID_FILE" ] && [ ! -f "$BASELINE_FILE" ] && [ ! -f "$OVERRIDE_MARKER_FILE" ]; then
         if [ "$kernel_value" = "1" ]; then
             log "WARNING: disablesleep=1 is active but Awake has no ownership record; leaving the user setting unchanged"
+            printf '%s\n' "disablesleep is on but Awake did not set it. Run 'awake fix' to clear it." > "$WHY_FILE"
+            notify_unowned_disablesleep_once
+        else
+            rm -f "$WHY_FILE" "$UNOWNED_NOTIFY_FILE"
         fi
         echo "normal" > "$STATE_FILE"
-        rm -f "$WHY_FILE"
         return 0
     fi
     stop_owned_caffeinate
@@ -1757,7 +1783,7 @@ restore_normal_sleep_settings() {
         fi
     fi
     echo "normal" > "$STATE_FILE"
-    rm -f "$WHY_FILE" "$OVERRIDE_MARKER_FILE"
+    rm -f "$WHY_FILE" "$OVERRIDE_MARKER_FILE" "$UNOWNED_NOTIFY_FILE"
 }
 
 apply_presenting_mode() {
@@ -2364,6 +2390,20 @@ cmd_mode() {
     esac
 }
 
+cmd_fix() {
+    if ! unowned_disablesleep_active; then
+        echo "Nothing to fix: no unowned disablesleep override detected."
+        return 0
+    fi
+    if sudo -n pmset -a disablesleep 0 2>/dev/null; then
+        rm -f "$WHY_FILE" "$UNOWNED_NOTIFY_FILE"
+        echo "Cleared disablesleep that Awake did not set. Your Mac can sleep normally again."
+    else
+        echo "Could not clear disablesleep (passwordless sudo for pmset required). Run: awake install" >&2
+        return 1
+    fi
+}
+
 cmd_doctor() {
     if [ "${1:-}" = "--json" ]; then
         refresh_setup_flags
@@ -2964,6 +3004,7 @@ case "${1:-}" in
     status)     shift; cmd_status "$@" ;;
     why)        shift; cmd_why "$@" ;;
     doctor)     shift; cmd_doctor "$@" ;;
+    fix)        cmd_fix ;;
     mode)       shift; cmd_mode "$@" ;;
     update)     shift; cmd_update "$@" ;;
     rules)      shift; cmd_rules "$@" ;;
@@ -2980,6 +3021,6 @@ case "${1:-}" in
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|fix|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

@@ -175,6 +175,7 @@ setup_state() {
     BASELINE_FILE="$dir/power-baseline.json"
     MODE_FILE="$dir/default-mode"
     WHY_FILE="$dir/awake-why"
+    UNOWNED_NOTIFY_FILE="$dir/awake-unowned-notified"
     BATTERY_GUARD_FILE="$dir/awake-battery-guard"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
