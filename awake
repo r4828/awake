@@ -2626,7 +2626,8 @@ cmd_for() {
     # Start the timer behind a publication handshake. The process waits until
     # its PID and complete lease are visible before it begins the countdown.
     (
-        local timer_pid="$BASHPID"
+        # bash 3.2 (stock macOS) has no BASHPID; get this subshell's PID via sh.
+        local timer_pid="$(exec sh -c 'echo $PPID')"
         local waiting_for_agents=false
         local publish_attempt=0
         while [ "$publish_attempt" -lt 500 ]; do
