@@ -1640,7 +1640,11 @@ def parse_custom():
 
 def parse_disablesleep():
     out = run(["pmset", "-g"])
-    match = re.search(r"^\s*disablesleep\s+(\d+)\s*$", out, re.MULTILINE)
+    match = re.search(
+        r"^\s*(?:disablesleep|sleepdisabled)\s+(\d+)\s*$",
+        out,
+        re.IGNORECASE | re.MULTILINE,
+    )
     return int(match.group(1)) if match else 0
 
 
@@ -1816,7 +1820,8 @@ restore_fallback_sleep_settings() {
 }
 
 current_disablesleep_value() {
-    pmset -g 2>/dev/null | awk '$1 == "disablesleep" { print $2; exit }'
+    pmset -g 2>/dev/null |
+        awk 'tolower($1) == "disablesleep" || tolower($1) == "sleepdisabled" { print $2; exit }'
 }
 
 mark_power_override_active() {
