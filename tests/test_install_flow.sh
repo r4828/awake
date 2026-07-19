@@ -84,7 +84,36 @@ EOF
 
 cat > "$STUB_BIN/open" <<'EOF'
 #!/bin/bash
+set -euo pipefail
+[ "${AWAKE_TEST_OPEN_FAIL:-0}" != "1" ] || exit 1
+touch "$AWAKE_STATE_DIR/ui-running"
+count="$(cat "$AWAKE_STATE_DIR/ui-open-count" 2>/dev/null || echo 0)"
+echo $(( count + 1 )) > "$AWAKE_STATE_DIR/ui-open-count"
 exit 0
+EOF
+
+cat > "$STUB_BIN/pgrep" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = "-x" ] && [ "${2:-}" = "AwakeUI" ] && [ -f "$AWAKE_STATE_DIR/ui-running" ]; then
+    echo 42424
+    exit 0
+fi
+exit 1
+EOF
+
+cat > "$STUB_BIN/pkill" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = "-TERM" ] && [ "${2:-}" = "-x" ] && [ "${3:-}" = "AwakeUI" ]; then
+    rm -f "$AWAKE_STATE_DIR/ui-running"
+fi
+exit 0
+EOF
+
+cat > "$STUB_BIN/caffeinate" <<'EOF'
+#!/bin/bash
+sleep 600
 EOF
 
 cat > "$STUB_BIN/launchctl" <<'EOF'
@@ -150,6 +179,44 @@ grep -Fq '"packageName": "awake-agent"' "$TEST_HOME/.config/awake/install-metada
     exit 1
 }
 [ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/ui/main.swift" ]
+[ -f "$AWAKE_STATE_DIR/ui-running" ]
+[ "$(cat "$AWAKE_STATE_DIR/ui-open-count")" = "1" ]
+grep -Fq "Awake.app is running" <<<"$INSTALL_OUTPUT"
+
+# Exercise the installed CLI as a user would. The five-minute timer must
+# outlive the shell that invoked it, publish a 300-second deadline, keep the
+# runtime and menu-bar app alive, and restore normal sleep when cancelled.
+TIMER_START="$(date +%s)"
+/bin/bash -c '"$1" for 5m >/dev/null' awake-test "$TEST_HOME/.local/bin/awake"
+TIMER_END="$(cat "$AWAKE_STATE_DIR/awake-for-end")"
+TIMER_DELTA=$(( TIMER_END - TIMER_START ))
+[ "$TIMER_DELTA" -ge 298 ]
+[ "$TIMER_DELTA" -le 302 ]
+TIMER_PID="$(cat "$AWAKE_STATE_DIR/awake-for.pid")"
+kill -0 "$TIMER_PID"
+sleep 0.2
+kill -0 "$TIMER_PID"
+[ -d "$AWAKE_STATE_DIR/awake-leases/manual-timer" ]
+TIMER_STATUS="$("$TEST_HOME/.local/bin/awake" status --json)"
+[[ "$TIMER_STATUS" == *'"timerActive":true'* ]]
+[[ "$TIMER_STATUS" == *'"effectiveLeaseId":"manual-timer"'* ]]
+[[ "$TIMER_STATUS" == *'"powerState":"nosleep-display"'* ]]
+[ -f "$AWAKE_STATE_DIR/ui-running" ]
+"$TEST_HOME/.local/bin/awake" cancel-timer >/dev/null
+TIMER_STATUS="$("$TEST_HOME/.local/bin/awake" status --json)"
+[[ "$TIMER_STATUS" == *'"timerActive":false'* ]]
+[[ "$TIMER_STATUS" == *'"leaseCount":0'* ]]
+[[ "$TIMER_STATUS" == *'"powerState":"normal"'* ]]
+
+"$TEST_HOME/.local/bin/awake" nosleep >/dev/null
+[[ "$("$TEST_HOME/.local/bin/awake" status --json)" == *'"powerState":"nosleep-full"'* ]]
+"$TEST_HOME/.local/bin/awake" yessleep >/dev/null
+"$TEST_HOME/.local/bin/awake" run /usr/bin/true >/dev/null
+"$TEST_HOME/.local/bin/awake" agent-auto on >/dev/null
+[ "$("$TEST_HOME/.local/bin/awake" agent-auto status)" = "enabled" ]
+"$TEST_HOME/.local/bin/awake" agent-auto off >/dev/null
+[ "$("$TEST_HOME/.local/bin/awake" agent-auto status)" = "disabled" ]
+"$TEST_HOME/.local/bin/awake" runtime-status >/dev/null
 
 rm -f "$TEST_HOME/.local/bin/awake-package.json" \
     "$TEST_HOME/.local/bin/AwakeApp/main.swift" \
@@ -160,5 +227,13 @@ SECOND_INSTALL_OUTPUT="$("$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin
 }
 [ -f "$TEST_HOME/.local/bin/awake-package.json" ]
 [ -f "$TEST_HOME/.local/bin/AwakeApp/main.swift" ]
+[ -f "$AWAKE_STATE_DIR/ui-running" ]
+[ "$(cat "$AWAKE_STATE_DIR/ui-open-count")" = "2" ]
+
+if AWAKE_TEST_OPEN_FAIL=1 "$TEST_HOME/.local/bin/awake" install >"$TEST_ROOT/failed-install.log" 2>&1; then
+    echo "install unexpectedly succeeded when the menu-bar app could not open" >&2
+    exit 1
+fi
+grep -Fq "the menu bar app could not be started" "$TEST_ROOT/failed-install.log"
 
 echo "install flow tests passed"

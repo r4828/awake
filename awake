@@ -79,6 +79,7 @@ WHY_FILE="$RUNTIME_STATE_DIR/awake-why"
 BATTERY_GUARD_FILE="$RUNTIME_STATE_DIR/awake-battery-guard"
 RUNTIME_READY_FILE="$RUNTIME_STATE_DIR/awake-runtime-ready"
 RUNTIME_HEARTBEAT_FILE="$RUNTIME_STATE_DIR/awake-runtime-heartbeat"
+HOOK_STATE_DIR="${AWAKE_HOOK_STATE_DIR:-/tmp}"
 LOG_PREFIX="[awake]"
 PACKAGE_NAME="awake-agent"
 GITHUB_RELEASES_URL="https://github.com/nickita-khylkouski/awake/releases/latest"
@@ -1295,7 +1296,7 @@ fresh_hook_files() {
     # Also clean up stale ones
     local now count=0
     now=$(date +%s)
-    for f in /tmp/awake-claude-* /tmp/awake-codex-*; do
+    for f in "$HOOK_STATE_DIR"/awake-claude-* "$HOOK_STATE_DIR"/awake-codex-*; do
         [ -f "$f" ] || continue
         local mtime
         mtime=$(stat -f %m "$f" 2>/dev/null) || continue
@@ -2976,14 +2977,51 @@ cmd_run_command() {
     return $exit_code
 }
 
-cmd_ui() {
+awake_ui_is_running() {
+    pgrep -x AwakeUI >/dev/null 2>&1
+}
+
+launch_installed_awake_ui() {
     local app="$LOCAL_BIN_DIR/Awake.app"
-    if [ ! -d "$app" ]; then
+    local attempt=0
+    [ -d "$app" ] || {
         log "ERROR: $app not found. Run: awake install"
         return 1
+    }
+
+    # An upgrade replaces the executable on disk. Restart an existing copy so
+    # a successful install always leaves the newly installed build running.
+    if awake_ui_is_running; then
+        pkill -TERM -x AwakeUI 2>/dev/null || true
+        while awake_ui_is_running && [ "$attempt" -lt 50 ]; do
+            sleep 0.1
+            attempt=$(( attempt + 1 ))
+        done
+        if awake_ui_is_running; then
+            log "ERROR: the previous Awake menu bar app did not exit"
+            return 1
+        fi
     fi
+
+    open "$app" >/dev/null 2>&1 || {
+        log "ERROR: macOS could not open $app"
+        return 1
+    }
+    attempt=0
+    while ! awake_ui_is_running && [ "$attempt" -lt 50 ]; do
+        sleep 0.1
+        attempt=$(( attempt + 1 ))
+    done
+    if ! awake_ui_is_running; then
+        log "ERROR: Awake.app opened but its menu bar process did not stay running"
+        return 1
+    fi
+    log "Awake.app is running"
+}
+
+cmd_ui() {
     log "Launching menu bar UI..."
-    open "$app"
+    launch_installed_awake_ui
 }
 
 cmd_screens() {
@@ -3169,8 +3207,11 @@ CONF
     if [ -d "$LOCAL_BIN_DIR/Awake.app" ]; then
         if $auto_open; then
             log "Opening Awake.app..."
-            open "$LOCAL_BIN_DIR/Awake.app" >/dev/null 2>&1 || true
-            log "Done. Awake.app should open now."
+            if ! launch_installed_awake_ui; then
+                log "ERROR: Awake was installed, but the menu bar app could not be started"
+                return 1
+            fi
+            log "Done. Awake is installed and running."
         else
             log "Done. Run: open ~/.local/bin/Awake.app"
         fi

@@ -44,5 +44,6 @@ grep -Fq 'func applicationWillTerminate' "$APP_ROOT/Contents/Resources/ui/main.s
 grep -Fq 'blackoutController.deactivate(synchronously: true)' "$APP_ROOT/Contents/Resources/ui/main.swift"
 grep -Fq 'forceShowScreens(synchronously: true)' "$APP_ROOT/Contents/Resources/ui/main.swift"
 grep -Fq 'event.keyCode == UInt16(kVK_Escape)' "$APP_ROOT/Contents/Resources/ui/main.swift"
+grep -Fq 'AWAKE_INSTALL_SKIP_RUNTIME=1 AWAKE_INSTALL_NO_OPEN=1' "$REPO_DIR/package-app.sh"
 
 echo "build ui tests passed"

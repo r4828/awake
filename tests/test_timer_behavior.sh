@@ -213,6 +213,8 @@ setup_state() {
     FOR_END_FILE="$dir/awake-for-end"
     FOR_TOKEN_FILE="$dir/awake-for-token"
     DISPLAY_SLEEP_FILE="$dir/awake-display-sleep"
+    RUNTIME_READY_FILE="$dir/awake-runtime-ready"
+    RUNTIME_HEARTBEAT_FILE="$dir/awake-runtime-heartbeat"
     LEASES_DIR="$dir/leases"
     RULES_DIR="$dir/rules.d"
     BASELINE_FILE="$dir/power-baseline.json"
@@ -222,11 +224,11 @@ setup_state() {
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
     RECONCILE_LOCK_FILE="$dir/reconcile-lock"
     WHY_FILE="$dir/awake-why"
+    HOOK_STATE_DIR="$dir/hooks"
     : > "$PMSET_LOG"
     set_agents_active 0
-    rm -f /tmp/awake-claude-* /tmp/awake-codex-* 2>/dev/null || true
     seed_pmset_state
-    mkdir -p "$LEASES_DIR" "$RULES_DIR"
+    mkdir -p "$LEASES_DIR" "$RULES_DIR" "$HOOK_STATE_DIR"
     echo "agent-safe" > "$MODE_FILE"
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "awake-agent",
-  "version": "2.0.10",
+  "version": "2.0.11",
   "description": "Keep your Mac awake while AI coding agents run.",
   "license": "MIT",
   "os": [
