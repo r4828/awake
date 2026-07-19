@@ -487,6 +487,78 @@ test_launch_recovery_leaves_unowned_kernel_setting_alone() {
     [ ! -f "$OVERRIDE_MARKER_FILE" ]
 }
 
+test_fix_clears_unowned_disablesleep() {
+    setup_state fix-clears-unowned
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_contains "Cleared disablesleep that Awake did not set" "$STATE_ROOT/cmd-out.txt"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
+test_fix_noop_when_no_unowned_override() {
+    setup_state fix-noop-clean
+    echo "0" > "$PMSET_STATE_DIR/disablesleep"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Nothing to fix" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
+test_fix_refuses_to_clear_owned_session() {
+    setup_state fix-owned-session
+    activate_nosleep >/dev/null
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Nothing to fix" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_fix_does_not_clear_while_reconcile_lock_held() {
+    setup_state fix-lock-contention
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    sleep 10 &
+    local holder=$!
+    printf '%s\n' "$holder:0:contend" > "$RECONCILE_LOCK_FILE"
+
+    local rc=0
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1 || rc=$?
+
+    kill "$holder" 2>/dev/null || true
+
+    assert_equals "1" "$rc"
+    assert_contains "Could not acquire" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_equals "$holder:0:contend" "$(cat "$RECONCILE_LOCK_FILE")"
+    rm -f "$RECONCILE_LOCK_FILE"
+}
+
+test_unowned_disablesleep_surfaces_in_why() {
+    setup_state unowned-why
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    why_summary > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Awake did not set it" "$STATE_ROOT/cmd-out.txt"
+    assert_contains "awake fix" "$STATE_ROOT/cmd-out.txt"
+}
+
+test_unowned_disablesleep_surfaces_in_warnings() {
+    setup_state unowned-warnings
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    warnings_json > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Awake did not set it" "$STATE_ROOT/cmd-out.txt"
+}
+
 test_failed_recovery_keeps_ownership_for_retry() {
     setup_state recovery-retry
     activate_nosleep >/dev/null
@@ -693,6 +765,12 @@ test_restore_without_baseline_falls_back
 test_launch_recovery_restores_after_crashed_daemon
 test_reconcile_repairs_kernel_state_mismatch
 test_launch_recovery_leaves_unowned_kernel_setting_alone
+test_fix_clears_unowned_disablesleep
+test_fix_noop_when_no_unowned_override
+test_fix_refuses_to_clear_owned_session
+test_fix_does_not_clear_while_reconcile_lock_held
+test_unowned_disablesleep_surfaces_in_why
+test_unowned_disablesleep_surfaces_in_warnings
 test_failed_recovery_keeps_ownership_for_retry
 test_runtime_signal_preserves_state_for_supervisor_restart
 test_clean_signal_exit_does_not_request_restart
