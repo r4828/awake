@@ -180,6 +180,8 @@ write_batt_case() {
     if [ "$source" = "ac" ]; then
         state="charging"
         source_label="AC Power"
+    elif [ "$source" = "ac-not-charging" ]; then
+        source_label="AC Power"
     fi
 
     case "$format" in
@@ -253,6 +255,14 @@ if enforce_battery_guard; then
 fi
 if grep -q "pmset sleepnow" "$PMSET_LOG"; then
     echo "battery guard force-slept while charging" >&2
+    exit 1
+fi
+
+setup_state
+write_batt_case 4 ac-not-charging split
+enforce_battery_guard
+if ! grep -q "pmset sleepnow" "$PMSET_LOG"; then
+    echo "battery guard skipped an AC-powered battery that was not charging" >&2
     exit 1
 fi
 

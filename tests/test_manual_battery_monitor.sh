@@ -22,42 +22,47 @@ MODE_FILE="$TEST_ROOT/default-mode"
 PID_FILE="$TEST_ROOT/awake.pid"
 DAEMON_LOCK_DIR="$TEST_ROOT/daemon-lock"
 DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+LEASE_MONITOR_READY_FILE="$TEST_ROOT/lease-monitor-ready"
+LEASE_MONITOR_HEARTBEAT_FILE="$TEST_ROOT/lease-monitor-heartbeat"
 mkdir -p "$LEASES_DIR" "$RULES_DIR"
 printf 'presenting\n' > "$MODE_FILE"
 
-reconcile_effective_state() { return 0; }
-active_daemon_pid() { return 1; }
-cmd_daemon_start() { printf '%s\n' "$*" >> "$MONITOR_LOG"; }
-
-AWAKE_LEASE_MONITOR_ENABLED=1
-activate_nosleep
-grep -Fxq -- '--bg --lease-monitor' "$MONITOR_LOG"
+lease_count() { printf '1\n'; }
+lease_monitor_is_healthy() { return 1; }
+cmd_lease_monitor_start() { printf 'start\n' >> "$MONITOR_LOG"; }
+ensure_active_lease_monitor
+grep -Fxq 'start' "$MONITOR_LOG"
 
 : > "$MONITOR_LOG"
-active_daemon_pid() { printf '12345\n'; }
+lease_monitor_is_healthy() { return 0; }
 ensure_active_lease_monitor
 [ ! -s "$MONITOR_LOG" ]
 
 : > "$MONITOR_LOG"
-active_daemon_pid() { return 1; }
-lease_remove "manual-toggle"
-ensure_active_lease_monitor
-[ ! -s "$MONITOR_LOG" ]
-
-daemon_cleanup() { :; }
-cleanup() { cleanup_test; }
-recover_power_state_on_launch() { :; }
-acquire_daemon_lock() { return 0; }
-log() { :; }
-
-battery_checks=0
-enforce_battery_guard() {
-    battery_checks=$((battery_checks + 1))
-    return 1
-}
 lease_count() { printf '0\n'; }
-cmd_daemon --lease-monitor
-[ "$battery_checks" -eq 0 ]
+ensure_active_lease_monitor
+[ ! -s "$MONITOR_LOG" ]
+
+lease_count() { printf '1\n'; }
+lease_monitor_is_healthy() { return 1; }
+cmd_lease_monitor_start() { return 1; }
+if ensure_active_lease_monitor; then
+    echo "monitor startup unexpectedly succeeded" >&2
+    exit 1
+fi
+
+cleanup() { cleanup_test; }
+log() { :; }
+restore_normal_sleep_settings() { :; }
+enforce_battery_guard() { printf 'guard\n' >> "$MONITOR_LOG"; return 1; }
+POLL_INTERVAL=1
+
+: > "$MONITOR_LOG"
+lease_count() { printf '0\n'; }
+(cmd_lease_monitor)
+[ ! -e "$LEASE_MONITOR_READY_FILE" ]
+[ ! -e "$LEASE_MONITOR_HEARTBEAT_FILE" ]
+[ ! -s "$MONITOR_LOG" ]
 
 LEASE_PROBE_FILE="$TEST_ROOT/lease-probe"
 printf '0\n' > "$LEASE_PROBE_FILE"
@@ -72,9 +77,25 @@ lease_count() {
         printf '0\n'
     fi
 }
-reconcile_effective_state() { :; }
-sleep() { :; }
-cmd_daemon --lease-monitor
-[ "$battery_checks" -eq 1 ]
+: > "$MONITOR_LOG"
+(cmd_lease_monitor)
+grep -Fxq 'guard' "$MONITOR_LOG"
+[ ! -e "$LEASE_MONITOR_READY_FILE" ]
+[ ! -e "$LEASE_MONITOR_HEARTBEAT_FILE" ]
+
+sudo() { return 0; }
+reconcile_effective_state() { return 1; }
+restore_sleep_after_monitor_failure() { printf 'restored\n' >> "$MONITOR_LOG"; }
+: > "$MONITOR_LOG"
+if cmd_run_command true; then
+    echo "run command unexpectedly started without a monitor" >&2
+    exit 1
+fi
+[ ! -d "$LEASES_DIR/run-command" ]
+grep -Fxq 'restored' "$MONITOR_LOG"
+
+lease_create_or_update "run-command" "command" "presenting" "Stale command" 85 "" "test" "999999"
+cleanup_invalid_leases
+[ ! -d "$LEASES_DIR/run-command" ]
 
 echo "manual battery monitor tests passed"

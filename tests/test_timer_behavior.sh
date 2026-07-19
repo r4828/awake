@@ -157,13 +157,13 @@ export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 export AWAKE_TEST_PMSET_LOG="$PMSET_LOG"
 export AWAKE_TEST_PMSET_STATE_DIR="$PMSET_STATE_DIR"
 export AWAKE_TEST_AGENTS_FILE="$AGENTS_STATE_FILE"
-export AWAKE_LEASE_MONITOR_ENABLED=0
 
 AWAKE_LIB="$TEST_ROOT/awake-lib.sh"
 sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
 # shellcheck source=/dev/null
 source "$AWAKE_LIB"
 
+ensure_active_lease_monitor() { return 0; }
 parse_duration() {
     echo 1
 }

@@ -163,7 +163,7 @@ Most keep-awake apps are generic toggles. `awake` is opinionated:
 └─────────────────────────────────────────────────────┘
 ```
 
-Manual sessions, timers, and `awake run` also start a short-lived battery monitor when the agent daemon is off. The monitor exits after the last protected session ends.
+Every active Awake lease has a launchd-supervised battery monitor. Awake verifies its heartbeat before it keeps a session awake; launchd restarts the monitor after a crash, and it exits after the last lease ends.
 
 ### Two layers of sleep prevention
 
@@ -411,7 +411,7 @@ POLL_INTERVAL=15
 # Prevents sleep during brief pauses between agent runs
 GRACE_SECONDS=300
 
-# Force sleep when battery reaches this % (even if agents are running)
+# Force sleep when battery reaches this % while it is not charging (even if agents are running)
 BATTERY_CRITICAL=5
 
 # Send a macOS notification when battery drops below this %

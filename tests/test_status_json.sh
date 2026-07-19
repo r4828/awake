@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+
 REPO_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TEST_ROOT="$(mktemp -d /tmp/awake-status-test.XXXXXX)"
 STUB_BIN="$TEST_ROOT/bin"
@@ -108,7 +109,16 @@ doctor_json="$("$REPO_DIR/awake" doctor --json)"
 [[ "$doctor_json" == *'"warnings":['* ]]
 
 "$REPO_DIR/awake" rules add process codex --mode running --reason 'Rule "quoted" value' >/dev/null
-"$REPO_DIR/awake" nosleep >/dev/null
+mkdir -p /tmp/awake-leases/manual-toggle
+printf 'manual-toggle' > /tmp/awake-leases/manual-toggle/id
+printf 'manual' > /tmp/awake-leases/manual-toggle/type
+printf 'presenting' > /tmp/awake-leases/manual-toggle/mode
+printf 'Manual awake session' > /tmp/awake-leases/manual-toggle/reason
+printf '100' > /tmp/awake-leases/manual-toggle/priority
+printf '1' > /tmp/awake-leases/manual-toggle/started_at
+printf 'cli' > /tmp/awake-leases/manual-toggle/source
+printf '' > /tmp/awake-leases/manual-toggle/expires_at
+printf '1' > /tmp/awake-leases/manual-toggle/ready
 json="$("$REPO_DIR/awake" status --json)"
 [[ "$json" == *'"leaseCount":1'* ]]
 [[ "$json" == *'"effectiveMode":"presenting"'* ]]

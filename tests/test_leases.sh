@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+
 REPO_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TEST_ROOT="$(mktemp -d /tmp/awake-leases-test.XXXXXX)"
 STUB_BIN="$TEST_ROOT/bin"
@@ -155,6 +156,7 @@ sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
 # shellcheck source=/dev/null
 source "$AWAKE_LIB"
 
+ensure_active_lease_monitor() { return 0; }
 log() { :; }
 notify() { :; }
 active_daemon_pid() { return 1; }
