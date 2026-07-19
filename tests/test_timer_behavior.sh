@@ -518,6 +518,7 @@ test_fix_refuses_to_clear_owned_session() {
 
     assert_contains "Nothing to fix" "$STATE_ROOT/cmd-out.txt"
     assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_not_contains "disablesleep 0" "$PMSET_LOG"
 }
 
 test_fix_does_not_clear_while_reconcile_lock_held() {
@@ -536,6 +537,7 @@ test_fix_does_not_clear_while_reconcile_lock_held() {
     assert_equals "1" "$rc"
     assert_contains "Could not acquire" "$STATE_ROOT/cmd-out.txt"
     assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_equals "" "$(cat "$PMSET_LOG")"
     assert_equals "$holder:0:contend" "$(cat "$RECONCILE_LOCK_FILE")"
     rm -f "$RECONCILE_LOCK_FILE"
 }
@@ -584,6 +586,7 @@ test_fix_rechecks_ownership_after_acquiring_lock() {
     assert_equals "0" "$rc"
     assert_contains "an Awake session is now holding the override" "$STATE_ROOT/cmd-out.txt"
     assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_equals "" "$(cat "$PMSET_LOG")"
     [ ! -f "$RECONCILE_LOCK_FILE" ]
 }
 
