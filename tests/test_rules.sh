@@ -114,7 +114,7 @@ sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
 # shellcheck source=/dev/null
 source "$AWAKE_LIB"
 
-ensure_active_lease_monitor() { return 0; }
+ensure_runtime_ready() { return 0; }
 log() { :; }
 notify() { :; }
 
@@ -136,6 +136,7 @@ setup_state() {
     WHY_FILE="$dir/awake-why"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+    RECONCILE_LOCK_FILE="$dir/reconcile-lock"
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
     echo "agent-safe" > "$MODE_FILE"
     echo 0 > "$PMSET_STATE_DIR/disablesleep"

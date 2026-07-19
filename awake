@@ -21,6 +21,9 @@ CONFIG_FILE="$HOME/.config/awake/config"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 # --- Constants ---
+#
+# Architecture: installation owns one persistent launchd runtime. User actions
+# only publish leases and change power state; they never bootstrap a process.
 
 resolve_script_path() {
     local src="${1:-$0}"
@@ -46,36 +49,42 @@ REPO_APP_PRIVATE_HEADER="$SCRIPT_DIR/ui/private-apis.h"
 BUNDLED_APP_SRC_FILE="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/main.swift"
 BUNDLED_APP_PRIVATE_HEADER="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/private-apis.h"
 LOCAL_PACKAGE_JSON="$LOCAL_BIN_DIR/awake-package.json"
-LAUNCH_AGENT_LABEL="com.awake.daemon"
-LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
-LEASE_MONITOR_LABEL="com.awake.lease-monitor"
-LEASE_MONITOR_PATH="$HOME/Library/LaunchAgents/$LEASE_MONITOR_LABEL.plist"
+RUNTIME_LABEL="com.awake.runtime"
+RUNTIME_PATH="$HOME/Library/LaunchAgents/$RUNTIME_LABEL.plist"
+LEGACY_DAEMON_LABEL="com.awake.daemon"
+LEGACY_DAEMON_PATH="$HOME/Library/LaunchAgents/$LEGACY_DAEMON_LABEL.plist"
+LEGACY_MONITOR_LABEL="com.awake.lease-monitor"
+LEGACY_MONITOR_PATH="$HOME/Library/LaunchAgents/$LEGACY_MONITOR_LABEL.plist"
+AGENT_AUTO_FILE="$HOME/.config/awake/agent-auto-enabled"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
 OVERRIDE_MARKER_FILE="$HOME/.config/awake/power-override-active"
 MODE_FILE="$HOME/.config/awake/default-mode"
 RULES_DIR="$HOME/.config/awake/rules.d"
 INSTALL_METADATA_FILE="$HOME/.config/awake/install-metadata.json"
 UPDATE_CACHE_FILE="$HOME/.config/awake/update-cache.json"
-PID_FILE="/tmp/awake.pid"
-DAEMON_LOCK_DIR="/tmp/awake-daemon.lock"
+RUNTIME_STATE_DIR="${AWAKE_STATE_DIR:-/tmp}"
+PID_FILE="$RUNTIME_STATE_DIR/awake.pid"
+DAEMON_LOCK_DIR="$RUNTIME_STATE_DIR/awake-daemon.lock"
 DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
-LEASES_DIR="/tmp/awake-leases"
-STATE_FILE="/tmp/awake-state"
-LAST_ACTIVE_FILE="/tmp/awake-last-active"
-CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
-FOR_PID_FILE="/tmp/awake-for.pid"
-FOR_END_FILE="/tmp/awake-for-end"
-FOR_TOKEN_FILE="/tmp/awake-for-token"
-DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
-WHY_FILE="/tmp/awake-why"
-BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
-LEASE_MONITOR_READY_FILE="/tmp/awake-lease-monitor-ready"
-LEASE_MONITOR_HEARTBEAT_FILE="/tmp/awake-lease-monitor-heartbeat"
+RECONCILE_LOCK_FILE="$RUNTIME_STATE_DIR/awake-reconcile.lock"
+LEASES_DIR="$RUNTIME_STATE_DIR/awake-leases"
+STATE_FILE="$RUNTIME_STATE_DIR/awake-state"
+LAST_ACTIVE_FILE="$RUNTIME_STATE_DIR/awake-last-active"
+CAFFEINE_PID_FILE="$RUNTIME_STATE_DIR/awake-caffeinate.pid"
+FOR_PID_FILE="$RUNTIME_STATE_DIR/awake-for.pid"
+FOR_END_FILE="$RUNTIME_STATE_DIR/awake-for-end"
+FOR_TOKEN_FILE="$RUNTIME_STATE_DIR/awake-for-token"
+DISPLAY_SLEEP_FILE="$RUNTIME_STATE_DIR/awake-display-sleep"
+WHY_FILE="$RUNTIME_STATE_DIR/awake-why"
+BATTERY_GUARD_FILE="$RUNTIME_STATE_DIR/awake-battery-guard"
+RUNTIME_READY_FILE="$RUNTIME_STATE_DIR/awake-runtime-ready"
+RUNTIME_HEARTBEAT_FILE="$RUNTIME_STATE_DIR/awake-runtime-heartbeat"
 LOG_PREFIX="[awake]"
 PACKAGE_NAME="awake-agent"
 GITHUB_RELEASES_URL="https://github.com/nickita-khylkouski/awake/releases/latest"
 UPDATE_CACHE_TTL="${AWAKE_UPDATE_CACHE_TTL:-21600}"
 UPDATE_APPLY_TIMEOUT="${AWAKE_UPDATE_APPLY_TIMEOUT:-300}"
+LAUNCHCTL_BIN="${AWAKE_LAUNCHCTL_BIN:-/bin/launchctl}"
 
 # --- Helpers ---
 
@@ -84,20 +93,23 @@ log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 now_epoch() { date +%s; }
 
 ensure_runtime_dirs() {
-    mkdir -p "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
+    mkdir -p "$RUNTIME_STATE_DIR" "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
 }
 
 launch_agent_domain() {
     printf 'gui/%s' "$(id -u)"
 }
 
-launch_agent_target() {
-    printf '%s/%s' "$(launch_agent_domain)" "$LAUNCH_AGENT_LABEL"
+runtime_target() {
+    printf '%s/%s' "$(launch_agent_domain)" "$RUNTIME_LABEL"
 }
 
-launch_agent_loaded() {
-    [ -f "$LAUNCH_AGENT_PATH" ] || return 1
-    /bin/launchctl print "$(launch_agent_target)" >/dev/null 2>&1
+runtime_loaded() {
+    "$LAUNCHCTL_BIN" print "$(runtime_target)" >/dev/null 2>&1
+}
+
+legacy_target() {
+    printf '%s/%s' "$(launch_agent_domain)" "$1"
 }
 
 json_escape() {
@@ -750,20 +762,21 @@ wait_for_pid_exit() {
     return 1
 }
 
-pid_matches_awake_daemon() {
+pid_matches_awake_runtime() {
     local pid="${1:-}"
     pid_is_alive "$pid" || return 1
-    local cmd
+    local cmd expected
     cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
-    [[ "$cmd" == *"_daemon"* && "$cmd" == *"$(basename "$SCRIPT_PATH")"* ]]
+    expected="$(runtime_command_path)"
+    [[ "$cmd" == *"$expected _runtime"* ]]
 }
 
-daemon_pid_from_process_list() {
+runtime_pid_from_process_list() {
     ps -axo pid=,command= 2>/dev/null | while read -r pid cmdline; do
         [ -n "$pid" ] || continue
         case "$cmdline" in
-            *"/awake _daemon"*|*" awake _daemon"*)
-                if pid_matches_awake_daemon "$pid"; then
+            *"/awake _runtime"*|*" awake _runtime"*)
+                if pid_matches_awake_runtime "$pid"; then
                     echo "$pid"
                     return 0
                 fi
@@ -772,66 +785,49 @@ daemon_pid_from_process_list() {
     done | head -n 1
 }
 
-active_daemon_pid() {
+active_runtime_pid() {
     local pid
     pid="$(read_file_value "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ] && pid_matches_awake_daemon "$pid"; then
+    if [ -n "$pid" ] && pid_matches_awake_runtime "$pid"; then
         echo "$pid"
         return 0
     fi
-    pid="$(daemon_pid_from_process_list)"
+    pid="$(runtime_pid_from_process_list)"
     [ -n "$pid" ] || return 1
     echo "$pid"
 }
 
-lease_monitor_target() {
-    printf '%s/%s' "$(launch_agent_domain)" "$LEASE_MONITOR_LABEL"
-}
-
-lease_monitor_loaded() {
-    [ -f "$LEASE_MONITOR_PATH" ] || return 1
-    launchctl print "$(lease_monitor_target)" >/dev/null 2>&1
-}
-
-monitor_command_path() {
-    if [ -x "$LOCAL_BIN_DIR/awake" ] && grep -Fq '_lease-monitor' "$LOCAL_BIN_DIR/awake" 2>/dev/null; then
+runtime_command_path() {
+    if [ -x "$LOCAL_BIN_DIR/awake" ] && grep -Fq '_runtime' "$LOCAL_BIN_DIR/awake" 2>/dev/null; then
         printf '%s\n' "$LOCAL_BIN_DIR/awake"
     else
         printf '%s\n' "$SCRIPT_PATH"
     fi
 }
 
-pid_matches_awake_lease_monitor() {
-    local pid="${1:-}"
-    pid_is_alive "$pid" || return 1
-    local cmd
-    cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
-    [[ "$cmd" == *"_lease-monitor"* && "$cmd" == *"awake"* ]]
-}
-
-lease_monitor_ready_pid() {
-    local expected_generation="${1:-}" pid heartbeat generation extra now max_age
-    pid="$(read_file_value "$LEASE_MONITOR_READY_FILE" 2>/dev/null || true)"
-    heartbeat="$(read_file_value "$LEASE_MONITOR_HEARTBEAT_FILE" 2>/dev/null || true)"
-    read -r heartbeat generation extra <<< "$heartbeat"
+runtime_ready_pid() {
+    local pid heartbeat now max_age
+    pid="$(read_file_value "$RUNTIME_READY_FILE" 2>/dev/null || true)"
+    heartbeat="$(read_file_value "$RUNTIME_HEARTBEAT_FILE" 2>/dev/null || true)"
     case "$heartbeat" in ''|*[!0-9]*) return 1 ;; esac
-    case "$generation" in ''|*[!0-9]*) return 1 ;; esac
-    [ -z "$extra" ] || return 1
-    [ -z "$expected_generation" ] || [ "$generation" = "$expected_generation" ] || return 1
     now="$(now_epoch)"
     max_age=$(( POLL_INTERVAL * 3 ))
     [ "$max_age" -lt 45 ] && max_age=45
     [ $(( now - heartbeat )) -le "$max_age" ] || return 1
-    pid_matches_awake_lease_monitor "$pid" || return 1
+    pid_matches_awake_runtime "$pid" || return 1
     printf '%s\n' "$pid"
 }
 
-lease_monitor_is_healthy() {
-    lease_monitor_ready_pid "${1:-}" >/dev/null 2>&1
+runtime_is_healthy() {
+    runtime_ready_pid >/dev/null 2>&1
 }
 
-cleanup_stale_daemon_lease() {
-    if [ -d "$(lease_dir daemon-agent)" ] && ! active_daemon_pid >/dev/null 2>&1; then
+agent_auto_enabled() {
+    [ -f "$AGENT_AUTO_FILE" ]
+}
+
+cleanup_stale_agent_lease() {
+    if [ -d "$(lease_dir daemon-agent)" ] && { ! agent_auto_enabled || ! active_runtime_pid >/dev/null 2>&1; }; then
         lease_remove "daemon-agent"
     fi
 }
@@ -853,18 +849,18 @@ timer_claim_is_current() {
     [ "$(current_for_token 2>/dev/null)" = "$token" ]
 }
 
-daemon_lock_owned_by() {
+runtime_lock_owned_by() {
     local pid="$1"
     [ -d "$DAEMON_LOCK_DIR" ] || return 1
     [ "$(read_file_value "$DAEMON_OWNER_FILE" 2>/dev/null)" = "$pid" ]
 }
 
-daemon_owns_runtime() {
-    daemon_lock_owned_by "$$" || return 1
+runtime_owns_lock() {
+    runtime_lock_owned_by "$$" || return 1
     [ "$(read_file_value "$PID_FILE" 2>/dev/null)" = "$$" ]
 }
 
-acquire_daemon_lock() {
+acquire_runtime_lock() {
     if mkdir "$DAEMON_LOCK_DIR" 2>/dev/null; then
         echo "$$" > "$DAEMON_OWNER_FILE"
         return 0
@@ -872,7 +868,7 @@ acquire_daemon_lock() {
 
     local owner
     owner="$(read_file_value "$DAEMON_OWNER_FILE" 2>/dev/null || true)"
-    if pid_matches_awake_daemon "$owner"; then
+    if pid_matches_awake_runtime "$owner"; then
         return 1
     fi
 
@@ -881,10 +877,62 @@ acquire_daemon_lock() {
     echo "$$" > "$DAEMON_OWNER_FILE"
 }
 
-release_daemon_lock() {
-    if daemon_lock_owned_by "$$"; then
+release_runtime_lock() {
+    if runtime_lock_owned_by "$$"; then
         rm -rf "$DAEMON_LOCK_DIR"
     fi
+}
+
+current_process_pid() {
+    if [ -n "${BASHPID:-}" ]; then
+        CURRENT_PROCESS_PID="$BASHPID"
+    else
+        local probe
+        probe="$(dirname "$RECONCILE_LOCK_FILE")/.awake-process-pid.$$.$RANDOM"
+        /bin/sh -c 'printf "%s\n" "$PPID" > "$1"' awake-pid-probe "$probe"
+        CURRENT_PROCESS_PID="$(read_file_value "$probe" 2>/dev/null || true)"
+        rm -f "$probe"
+    fi
+    case "${CURRENT_PROCESS_PID:-}" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+reconcile_lock_owned_by() {
+    local token="$1"
+    [ -f "$RECONCILE_LOCK_FILE" ] || return 1
+    [ "$(read_file_value "$RECONCILE_LOCK_FILE" 2>/dev/null || true)" = "$token" ]
+}
+
+acquire_reconcile_lock() {
+    local attempt=0 owner="" owner_pid="" process_pid=""
+    current_process_pid || {
+        log "ERROR: could not determine reconciliation owner process"
+        return 1
+    }
+    process_pid="$CURRENT_PROCESS_PID"
+    RECONCILE_LOCK_TOKEN="$process_pid:$(now_epoch):$RANDOM"
+    while [ "$attempt" -lt 200 ]; do
+        if (set -C; printf '%s\n' "$RECONCILE_LOCK_TOKEN" > "$RECONCILE_LOCK_FILE") 2>/dev/null; then
+            return 0
+        fi
+        owner="$(read_file_value "$RECONCILE_LOCK_FILE" 2>/dev/null || true)"
+        owner_pid="${owner%%:*}"
+        if [ -n "$owner" ] && ! pid_is_alive "$owner_pid"; then
+            if [ "$(read_file_value "$RECONCILE_LOCK_FILE" 2>/dev/null || true)" = "$owner" ]; then
+                rm -f "$RECONCILE_LOCK_FILE" 2>/dev/null || true
+            fi
+        fi
+        sleep 0.01
+        attempt=$(( attempt + 1 ))
+    done
+    log "ERROR: timed out waiting for power-state reconciliation"
+    return 1
+}
+
+release_reconcile_lock() {
+    if reconcile_lock_owned_by "${RECONCILE_LOCK_TOKEN:-}"; then
+        rm -f "$RECONCILE_LOCK_FILE"
+    fi
+    RECONCILE_LOCK_TOKEN=""
 }
 
 python_temp_tool() {
@@ -1160,7 +1208,9 @@ setup_status_json() {
     printf '"codexDetected":%s,' "${HAS_CODEX:-false}"
     printf '"codexConfigured":%s,' "${HAS_CODEX_NOTIFY:-false}"
     printf '"powerState":"%s",' "$(json_escape "$(current_state)")"
-    printf '"daemonRunning":%s,' "$([ -n "$(active_daemon_pid 2>/dev/null || true)" ] && echo true || echo false)"
+    printf '"runtimeRunning":%s,' "$(runtime_is_healthy && echo true || echo false)"
+    printf '"daemonRunning":%s,' "$(agent_auto_enabled && echo true || echo false)"
+    printf '"agentAutoEnabled":%s,' "$(agent_auto_enabled && echo true || echo false)"
     printf '"timerActive":%s,' "$(timer_running && echo true || echo false)"
     printf '"leaseCount":%s,' "$(lease_count)"
     printf '"ruleCount":%s,' "$(rule_count)"
@@ -1489,9 +1539,10 @@ warnings_json() {
             warnings+=("Battery is low while Awake is active")
         fi
     fi
-    if [ "$(lease_count)" -eq 0 ] && ! timer_running && [ -z "$(active_daemon_pid 2>/dev/null || true)" ] && [[ "$(current_state)" == nosleep* ]]; then
+    if [ "$(lease_count)" -eq 0 ] && ! timer_running && [[ "$(current_state)" == nosleep* ]]; then
         warnings+=("Nosleep state appears stale: no active leases are holding the machine awake")
     fi
+    runtime_is_healthy || warnings+=("Awake runtime is unavailable; run awake install to repair it")
     if [ ${#warnings[@]} -eq 0 ]; then
         printf '[]'
         return 0
@@ -1876,9 +1927,9 @@ apply_running_mode() {
     echo "nosleep-display" > "$STATE_FILE"
 }
 
-reconcile_effective_state() {
+reconcile_effective_state_impl() {
     cleanup_expired_leases
-    cleanup_stale_daemon_lease
+    cleanup_stale_agent_lease
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
@@ -1886,8 +1937,9 @@ reconcile_effective_state() {
         restore_normal_sleep_settings
         return $?
     fi
-    ensure_active_lease_monitor || {
-        log "ERROR: no healthy lease battery monitor; refusing to hold Awake leases"
+    ensure_runtime_ready || {
+        log "ERROR: Awake runtime is unavailable; run: awake install"
+        restore_sleep_after_runtime_failure
         return 1
     }
     if enforce_battery_guard; then
@@ -1904,7 +1956,15 @@ reconcile_effective_state() {
     esac
 }
 
-restore_sleep_after_monitor_failure() {
+reconcile_effective_state() {
+    acquire_reconcile_lock || return 1
+    local result=0
+    reconcile_effective_state_impl || result=$?
+    release_reconcile_lock
+    return "$result"
+}
+
+restore_sleep_after_runtime_failure() {
     clear_manual_leases
     cancel_timer_session
     lease_remove "run-command"
@@ -1919,7 +1979,7 @@ restore_sleep_after_monitor_failure() {
 
 cleanup_invalid_leases() {
     cleanup_expired_leases
-    cleanup_stale_daemon_lease
+    cleanup_stale_agent_lease
 
     local dir id type owner rule_id
     for dir in "$LEASES_DIR"/*; do
@@ -1966,7 +2026,7 @@ recover_power_state_on_launch() {
     lease_remove "daemon-agent"
     sync_rule_leases
 
-    if agents_running || [ "$(lease_count)" -gt 0 ]; then
+    if [ "$(lease_count)" -gt 0 ]; then
         return 0
     fi
 
@@ -1979,8 +2039,8 @@ recover_power_state_on_launch() {
 activate_nosleep() {
     lease_create_or_update "manual-toggle" "manual" "presenting" "Manual awake session" 100 "" "cli"
     reconcile_effective_state || {
-        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
-        restore_sleep_after_monitor_failure
+        log "ERROR: Awake runtime is unavailable; refusing manual Awake session"
+        restore_sleep_after_runtime_failure
         return 1
     }
 }
@@ -1988,8 +2048,8 @@ activate_nosleep() {
 activate_nosleep_display() {
     lease_create_or_update "manual-toggle" "manual" "running" "Manual awake session with display sleep allowed" 100 "" "cli"
     reconcile_effective_state || {
-        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
-        restore_sleep_after_monitor_failure
+        log "ERROR: Awake runtime is unavailable; refusing manual Awake session"
+        restore_sleep_after_runtime_failure
         return 1
     }
 }
@@ -1997,16 +2057,16 @@ activate_nosleep_display() {
 activate_default_manual_session() {
     lease_create_or_update "manual-toggle" "manual" "$(current_default_mode)" "Manual awake session" 100 "" "cli"
     reconcile_effective_state || {
-        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
-        restore_sleep_after_monitor_failure
+        log "ERROR: Awake runtime is unavailable; refusing manual Awake session"
+        restore_sleep_after_runtime_failure
         return 1
     }
 }
 
 activate_yessleep() {
-    clear_manual_leases
+    lease_remove "manual-toggle"
     cancel_timer_session
-    reconcile_effective_state
+    reconcile_effective_state || return 1
 }
 
 force_sleep() {
@@ -2046,32 +2106,27 @@ force_sleep_if_unleased() {
     fi
 }
 
-cleanup() {
+runtime_cleanup() {
     trap - EXIT INT TERM
-    if ! daemon_owns_runtime; then
-        release_daemon_lock
-        return 0
+    if runtime_owns_lock; then
+        rm -f "$PID_FILE" "$RUNTIME_READY_FILE" "$RUNTIME_HEARTBEAT_FILE"
     fi
-    log "Shutting down — restoring normal sleep"
-    lease_remove "daemon-agent"
-    local dir
-    for dir in "$LEASES_DIR"/rule-*; do
-        [ -d "$dir" ] || continue
-        rm -rf "$dir"
-    done
-    local recovery_status=0
-    reconcile_effective_state || recovery_status=$?
-    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$WHY_FILE"
-    release_daemon_lock
-    return "$recovery_status"
+    release_runtime_lock
 }
 
-daemon_signal_exit() {
-    trap - EXIT INT TERM
-    if cleanup; then
-        exit 0
+runtime_signal_exit() {
+    if [ -n "${RUNTIME_SLEEP_PID:-}" ]; then
+        kill "$RUNTIME_SLEEP_PID" 2>/dev/null || true
     fi
-    exit 1
+    runtime_cleanup
+    exit 0
+}
+
+runtime_wait() {
+    sleep "$POLL_INTERVAL" &
+    RUNTIME_SLEEP_PID=$!
+    wait "$RUNTIME_SLEEP_PID" 2>/dev/null || true
+    RUNTIME_SLEEP_PID=""
 }
 
 parse_duration() {
@@ -2215,77 +2270,26 @@ cmd_setup() {
 
 # --- Commands ---
 
-cmd_daemon_start() {
-    local background=false
-    local existing_pid
-    [ "${1:-}" = "--bg" ] && background=true
-    ensure_runtime_dirs
-
-    existing_pid="$(active_daemon_pid 2>/dev/null || true)"
-    if [ -n "$existing_pid" ]; then
-        log "Already running (PID $existing_pid). Use: awake stop"
-        return 1
-    fi
-    rm -f "$PID_FILE"
-
-    if ! sudo -n pmset -g >/dev/null 2>&1; then
-        log "ERROR: passwordless sudo for pmset not configured"
-        log "Run: echo '$USER ALL=(ALL) NOPASSWD: /usr/bin/pmset' | sudo tee /etc/sudoers.d/pmset"
-        return 1
-    fi
-
-    if launch_agent_loaded; then
-        log "Starting supervised daemon..."
-        /bin/launchctl kickstart -k "$(launch_agent_target)" || {
-            log "ERROR: launchd could not start $LAUNCH_AGENT_LABEL"
-            return 1
-        }
-        log "Daemon handed to launchd — log: /tmp/awake.log"
-        return 0
-    fi
-
-    if $background; then
-        log "Starting in background..."
-        nohup "$0" _daemon </dev/null >>/tmp/awake.log 2>&1 &
-        local launched_pid=$!
-        local attempt=0
-        while [ "$attempt" -lt 20 ]; do
-            if pid_matches_awake_daemon "$launched_pid"; then
-                echo "$launched_pid" > "$PID_FILE"
-                log "PID $launched_pid — log: /tmp/awake.log"
-                return 0
-            fi
-            sleep 0.05
-            attempt=$(( attempt + 1 ))
-        done
-        log "ERROR: daemon did not start"
-        return 1
-    fi
-
-    "$0" _daemon
-}
-
-write_lease_monitor_agent() {
+write_runtime_agent() {
     local command_path
-    command_path="$(monitor_command_path)"
-    mkdir -p "$(dirname "$LEASE_MONITOR_PATH")"
-    cat > "$LEASE_MONITOR_PATH" <<EOF
+    command_path="$(runtime_command_path)"
+    mkdir -p "$(dirname "$RUNTIME_PATH")"
+    cat > "$RUNTIME_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$LEASE_MONITOR_LABEL</string>
+    <string>$RUNTIME_LABEL</string>
     <key>ProgramArguments</key>
     <array>
         <string>$command_path</string>
-        <string>_lease-monitor</string>
+        <string>_runtime</string>
     </array>
+    <key>RunAtLoad</key>
+    <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>2</integer>
     <key>ProcessType</key>
@@ -2299,196 +2303,196 @@ write_lease_monitor_agent() {
 EOF
 }
 
-cmd_lease_monitor_start() {
-    local expected_generation="${1:-}" attempt=0
-    has_passwordless_pmset || {
-        log "ERROR: passwordless sudo for pmset not configured"
-        return 1
-    }
-    rm -f "$LEASE_MONITOR_READY_FILE" "$LEASE_MONITOR_HEARTBEAT_FILE"
-    write_lease_monitor_agent || return 1
-    if lease_monitor_loaded; then
-        launchctl bootout "$(lease_monitor_target)" >/dev/null 2>&1 || {
-            log "ERROR: launchd could not reload $LEASE_MONITOR_LABEL"
+remove_legacy_jobs() {
+    local label path
+    for label in "$LEGACY_DAEMON_LABEL" "$LEGACY_MONITOR_LABEL"; do
+        "$LAUNCHCTL_BIN" bootout "$(legacy_target "$label")" >/dev/null 2>&1 || true
+    done
+    for path in "$LEGACY_DAEMON_PATH" "$LEGACY_MONITOR_PATH"; do
+        rm -f "$path"
+    done
+}
+
+install_runtime() {
+    local attempt=0 previous_pid=""
+    if [ -f "$LEGACY_DAEMON_PATH" ] || "$LAUNCHCTL_BIN" print "$(legacy_target "$LEGACY_DAEMON_LABEL")" >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$AGENT_AUTO_FILE")"
+        touch "$AGENT_AUTO_FILE"
+    fi
+    remove_legacy_jobs
+    previous_pid="$(active_runtime_pid 2>/dev/null || true)"
+    if runtime_loaded; then
+        "$LAUNCHCTL_BIN" bootout "$(runtime_target)" >/dev/null 2>&1 || {
+            log "ERROR: launchd could not reload $RUNTIME_LABEL"
             return 1
         }
     fi
-    launchctl bootstrap "$(launch_agent_domain)" "$LEASE_MONITOR_PATH" >/dev/null 2>&1 || {
-        log "ERROR: launchd could not load $LEASE_MONITOR_LABEL"
+    if [ -n "$previous_pid" ]; then
+        while pid_matches_awake_runtime "$previous_pid" && [ "$attempt" -lt 50 ]; do
+            sleep 0.05
+            attempt=$(( attempt + 1 ))
+        done
+        if pid_matches_awake_runtime "$previous_pid"; then
+            log "ERROR: previous Awake runtime did not stop during upgrade"
+            return 1
+        fi
+    fi
+    attempt=0
+    if [ -d "$DAEMON_LOCK_DIR" ]; then
+        local lock_owner
+        lock_owner="$(read_file_value "$DAEMON_OWNER_FILE" 2>/dev/null || true)"
+        pid_matches_awake_runtime "$lock_owner" || rm -rf "$DAEMON_LOCK_DIR"
+    fi
+    rm -f "$PID_FILE" "$RUNTIME_READY_FILE" "$RUNTIME_HEARTBEAT_FILE"
+    write_runtime_agent || return 1
+    "$LAUNCHCTL_BIN" bootstrap "$(launch_agent_domain)" "$RUNTIME_PATH" >/dev/null 2>&1 || {
+        log "ERROR: launchd could not load $RUNTIME_LABEL"
         return 1
     }
-    launchctl kickstart -k "$(lease_monitor_target)" >/dev/null 2>&1 || {
-        log "ERROR: launchd could not start $LEASE_MONITOR_LABEL"
+    "$LAUNCHCTL_BIN" kickstart "$(runtime_target)" >/dev/null 2>&1 || {
+        log "ERROR: launchd could not start $RUNTIME_LABEL"
         return 1
     }
     while [ "$attempt" -lt 50 ]; do
-        if lease_monitor_is_healthy "$expected_generation"; then
-            log "Lease battery monitor ready (PID $(lease_monitor_ready_pid "$expected_generation"))"
+        if runtime_is_healthy; then
+            log "Runtime ready (PID $(runtime_ready_pid))"
             return 0
         fi
         sleep 0.05
         attempt=$(( attempt + 1 ))
     done
-    launchctl bootout "$(lease_monitor_target)" >/dev/null 2>&1 || true
-    rm -f "$LEASE_MONITOR_READY_FILE" "$LEASE_MONITOR_HEARTBEAT_FILE"
-    log "ERROR: lease battery monitor did not become healthy"
+    log "ERROR: Awake runtime did not become healthy"
     return 1
 }
 
-ensure_active_lease_monitor() {
-    # Every lease gets an independent launchd-supervised battery monitor.
-    # It exits cleanly after the last lease and restarts after an unexpected exit.
-    [ "$(lease_count)" -gt 0 ] || return 0
-    local expected_generation
-    expected_generation="$(lease_generation)"
-    lease_monitor_is_healthy "$expected_generation" && return 0
-    cmd_lease_monitor_start "$expected_generation"
+ensure_runtime_ready() {
+    runtime_is_healthy && return 0
+    log "ERROR: Awake runtime is not running. Repair it with: awake install"
+    return 1
 }
 
-lease_monitor_write_heartbeat() {
-    printf '%s %s\n' "$(now_epoch)" "$(lease_generation)" > "$LEASE_MONITOR_HEARTBEAT_FILE"
-}
-
-lease_monitor_cleanup() {
-    trap - EXIT INT TERM
-    if [ "$(read_file_value "$LEASE_MONITOR_READY_FILE" 2>/dev/null || true)" = "$$" ]; then
-        rm -f "$LEASE_MONITOR_READY_FILE" "$LEASE_MONITOR_HEARTBEAT_FILE"
+cmd_runtime_status() {
+    if runtime_is_healthy; then
+        printf 'ready\n'
+        return 0
     fi
+    printf 'unavailable\n'
+    return 1
 }
 
-lease_monitor_signal_exit() {
-    lease_monitor_cleanup
-    [ "$(lease_count)" -eq 0 ] && exit 0
-    exit 1
+runtime_write_heartbeat() {
+    printf '%s\n' "$(now_epoch)" > "$RUNTIME_HEARTBEAT_FILE"
 }
 
-cmd_lease_monitor() {
-    trap lease_monitor_cleanup EXIT
-    trap lease_monitor_signal_exit INT TERM
-    ensure_runtime_dirs
-    printf '%s\n' "$$" > "$LEASE_MONITOR_READY_FILE"
-    lease_monitor_write_heartbeat
-    log "Lease battery monitor started (PID $$, poll=${POLL_INTERVAL}s)"
+runtime_reconcile_once() {
+    cleanup_invalid_leases
+    sync_rule_leases
 
-    while true; do
-        cleanup_invalid_leases
-        if [ "$(lease_count)" -eq 0 ]; then
-            local observed_generation
-            observed_generation="$(lease_generation)"
-            if [ "$(lease_count)" -eq 0 ] && [ "$(lease_generation)" = "$observed_generation" ]; then
-                log "No active leases — stopping battery monitor"
-                restore_normal_sleep_settings
-                return 0
+    if ! agent_auto_enabled; then
+        lease_remove "daemon-agent"
+        RUNTIME_GRACE_START=0
+    elif timer_running; then
+        RUNTIME_GRACE_START=0
+    elif agents_running; then
+        echo "$(now_epoch)" > "$LAST_ACTIVE_FILE"
+        RUNTIME_GRACE_START=0
+        lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Detected active coding agents" 70 "" "runtime"
+    else
+        lease_remove "daemon-agent"
+        if [ "$(rule_lease_count)" -gt 0 ]; then
+            RUNTIME_GRACE_START=0
+        elif [ "$RUNTIME_GRACE_START" -eq 0 ]; then
+            RUNTIME_GRACE_START="$(now_epoch)"
+            log "No agents — grace period ($(( GRACE_SECONDS / 60 ))m)"
+        else
+            local remaining=$(( GRACE_SECONDS - ($(now_epoch) - RUNTIME_GRACE_START) ))
+            if [ "$remaining" -le 0 ]; then
+                log "Grace expired — restoring normal sleep"
+                notify "Awake" "No coding agents are active. Normal sleep restored."
+                force_sleep_if_unleased
+                RUNTIME_GRACE_START=0
             fi
-            continue
         fi
-        lease_monitor_write_heartbeat
-        enforce_battery_guard || true
-        sleep "$POLL_INTERVAL"
-    done
-}
+    fi
 
-cmd_daemon() {
-    trap cleanup EXIT
-    trap daemon_signal_exit INT TERM
-    ensure_runtime_dirs
-    if ! acquire_daemon_lock; then
-        log "Another awake daemon is already running"
+    if ! reconcile_effective_state; then
+        log "ERROR: runtime reconciliation failed; restoring normal sleep"
+        restore_sleep_after_runtime_failure
+        RUNTIME_GRACE_START=0
         return 1
     fi
-    echo $$ > "$PID_FILE"
-    log "Daemon started (PID $$, poll=${POLL_INTERVAL}s, grace=${GRACE_SECONDS}s)"
+}
+
+cmd_runtime() {
+    trap runtime_cleanup EXIT
+    trap runtime_signal_exit INT TERM
+    ensure_runtime_dirs
+    if ! acquire_runtime_lock; then
+        log "Another Awake runtime is already running"
+        return 1
+    fi
+    printf '%s\n' "$$" > "$PID_FILE"
+    log "Runtime started (PID $$, poll=${POLL_INTERVAL}s, grace=${GRACE_SECONDS}s)"
     log "Watching: $AGENTS"
-
-    recover_power_state_on_launch
-
-    local grace_start=0
-
+    if ! acquire_reconcile_lock; then
+        log "ERROR: runtime could not acquire startup reconciliation"
+        return 1
+    fi
+    local recovery_status=0
+    recover_power_state_on_launch || recovery_status=$?
+    release_reconcile_lock
+    if [ "$recovery_status" -ne 0 ]; then
+        log "ERROR: runtime startup recovery failed"
+        return "$recovery_status"
+    fi
+    printf '%s\n' "$$" > "$RUNTIME_READY_FILE"
+    runtime_write_heartbeat
+    RUNTIME_GRACE_START=0
+    runtime_reconcile_once || true
     while true; do
-
-        sync_rule_leases
-
-        # --- Agent detection / manual timer override ---
-        if timer_running; then
-            grace_start=0
-        elif agents_running; then
-            echo "$(now_epoch)" > "$LAST_ACTIVE_FILE"
-            grace_start=0
-            lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Detected active coding agents" 70 "" "daemon"
-        else
-            lease_remove "daemon-agent"
-            if [ "$(rule_lease_count)" -gt 0 ]; then
-                grace_start=0
-                if ! reconcile_effective_state; then
-                    log "ERROR: lease battery monitor unavailable; restoring normal sleep"
-                    restore_sleep_after_monitor_failure
-                fi
-                sleep "$POLL_INTERVAL"
-                continue
-            fi
-            if [ "$grace_start" -eq 0 ]; then
-                grace_start=$(now_epoch)
-                log "No agents — grace period ($(( GRACE_SECONDS / 60 ))m)"
-                notify "awake" "No agents detected. Sleeping in $(( GRACE_SECONDS / 60 )) min."
-            fi
-
-            local elapsed=$(( $(now_epoch) - grace_start ))
-            local remaining=$(( GRACE_SECONDS - elapsed ))
-
-            if [ "$remaining" -le 0 ]; then
-                log "Grace expired — forcing sleep"
-                notify "awake" "Grace period expired. Sleeping now."
-                force_sleep_if_unleased
-                grace_start=0
-            else
-                if [[ "$(current_state)" == nosleep* ]]; then
-                    log "Grace: ${remaining}s remaining"
-                fi
-            fi
-        fi
-
-        if ! reconcile_effective_state; then
-            log "ERROR: lease battery monitor unavailable; restoring normal sleep"
-            restore_sleep_after_monitor_failure
-            grace_start=0
-        fi
-
-        sleep "$POLL_INTERVAL"
+        runtime_wait
+        runtime_write_heartbeat
+        runtime_reconcile_once || true
     done
+}
+
+cmd_agent_auto() {
+    local action="${1:-status}"
+    case "$action" in
+        on|enable|enabled)
+            ensure_runtime_ready || return 1
+            mkdir -p "$(dirname "$AGENT_AUTO_FILE")"
+            touch "$AGENT_AUTO_FILE"
+            if agents_running; then
+                lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Detected active coding agents" 70 "" "runtime"
+                reconcile_effective_state || return 1
+            fi
+            log "Automatic agent protection enabled"
+            ;;
+        off|disable|disabled)
+            rm -f "$AGENT_AUTO_FILE"
+            lease_remove "daemon-agent"
+            reconcile_effective_state || return 1
+            log "Automatic agent protection disabled"
+            ;;
+        status)
+            agent_auto_enabled && echo "enabled" || echo "disabled"
+            ;;
+        *)
+            echo "Usage: awake agent-auto [on|off|status]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_daemon_start() {
+    cmd_agent_auto on
 }
 
 cmd_stop() {
-    local pid=""
-    # Kill for-timer if running
-    if [ -f "$FOR_PID_FILE" ]; then
-        cancel_timer_session
-        log "Cancelled awake-for timer"
-    fi
-
-    pid="$(active_daemon_pid 2>/dev/null || true)"
-    if [ -z "$pid" ]; then
-        if [ -f "$PID_FILE" ]; then
-            log "Stale pidfile (not an awake daemon)"
-            rm -f "$PID_FILE"
-        else
-            log "Daemon not running"
-        fi
-    else
-        log "Stopping daemon (PID $pid)..."
-        kill "$pid"
-        wait_for_pid_exit "$pid" || true
-        pid_is_alive "$pid" && kill -9 "$pid" 2>/dev/null
-        log "Stopped"
-    fi
-
-    local current_pid
-    current_pid="$(active_daemon_pid 2>/dev/null || true)"
-    if [ -n "$current_pid" ] && [ "$current_pid" != "$pid" ]; then
-        log "Another daemon is already running (PID $current_pid); skipping restore"
-        return 1
-    fi
-
-    clear_manual_leases
+    rm -f "$AGENT_AUTO_FILE"
+    cancel_timer_session
+    lease_remove "manual-toggle"
     lease_remove "daemon-agent"
     local dir
     for dir in "$LEASES_DIR"/rule-*; do
@@ -2496,7 +2500,8 @@ cmd_stop() {
         rm -rf "$dir"
     done
     reconcile_effective_state
-    rm -f "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE"
+    rm -f "$LAST_ACTIVE_FILE"
+    log "Awake sessions stopped; the safety runtime remains supervised by launchd"
 }
 
 cmd_status() {
@@ -2505,17 +2510,14 @@ cmd_status() {
         setup_status_json
         return 0
     fi
-    local running=false
-    local daemon_pid=""
-    daemon_pid="$(active_daemon_pid 2>/dev/null || true)"
-    if [ -n "$daemon_pid" ]; then
-        running=true
-    fi
+    local runtime_pid=""
+    runtime_pid="$(active_runtime_pid 2>/dev/null || true)"
 
     local state=$(current_state)
     local agents=$(agent_summary)
 
-    echo "awake daemon: $($running && echo "running (PID $daemon_pid)" || echo "not running")"
+    echo "runtime:      $([ -n "$runtime_pid" ] && echo "running (PID $runtime_pid)" || echo "unavailable — run awake install")"
+    echo "agent auto:   $(agent_auto_enabled && echo enabled || echo disabled)"
     echo "power state:  $state"
     echo "mode:         $(effective_mode_value 2>/dev/null || echo "normal")"
     echo "agents:       $agents"
@@ -2615,7 +2617,8 @@ cmd_doctor() {
     echo "Awake doctor"
     echo "============"
     echo "mode:          $(current_default_mode)"
-    echo "daemon:        $([ -n "$(active_daemon_pid 2>/dev/null || true)" ] && echo running || echo stopped)"
+    echo "runtime:       $(runtime_is_healthy && echo healthy || echo unavailable)"
+    echo "agent auto:    $(agent_auto_enabled && echo enabled || echo disabled)"
     echo "leases:        $(lease_count)"
     echo "rules:         $(rule_count)"
     echo "sleep control: $([ "$HAS_PMSET" = true ] && echo ok || echo missing)"
@@ -2852,6 +2855,9 @@ cmd_for() {
         rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
     fi
     lease_remove "manual-timer"
+    # "Sleep in" replaces an indefinite manual session. Otherwise the timer
+    # would expire while manual-toggle silently kept the Mac awake forever.
+    lease_remove "manual-toggle"
 
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
@@ -2865,23 +2871,23 @@ cmd_for() {
     echo "$token" > "$FOR_TOKEN_FILE"
 
     # Start the timer behind a publication handshake. The process waits until
-    # its PID and complete lease are visible before it begins the countdown.
+    # its unique token and complete lease are visible before it begins the
+    # countdown. macOS ships Bash 3.2, which does not expose BASHPID.
     (
-        local timer_pid="$BASHPID"
         local waiting_for_agents=false
         local publish_attempt=0
         while [ "$publish_attempt" -lt 500 ]; do
-            if timer_claim_is_current "$token" "$timer_pid" && lease_exists "manual-timer"; then
+            if [ "$(current_for_token 2>/dev/null || true)" = "$token" ] && lease_exists "manual-timer" && timer_running; then
                 break
             fi
             sleep 0.01
             publish_attempt=$(( publish_attempt + 1 ))
         done
-        if ! timer_claim_is_current "$token" "$timer_pid" || ! lease_exists "manual-timer"; then
+        if [ "$(current_for_token 2>/dev/null || true)" != "$token" ] || ! lease_exists "manual-timer" || ! timer_running; then
             exit 1
         fi
         sleep "$secs"
-        while timer_claim_is_current "$token" "$timer_pid"; do
+        while [ "$(current_for_token 2>/dev/null || true)" = "$token" ] && lease_exists "manual-timer"; do
             if agents_running; then
                 if [ "$waiting_for_agents" = false ]; then
                     log "Timer expired but agents still running — waiting to restore Sleep OK"
@@ -2895,7 +2901,7 @@ cmd_for() {
             notify "awake" "Timer expired. Sleep OK restored."
             lease_remove "manual-timer"
             reconcile_effective_state
-            if timer_claim_is_current "$token" "$timer_pid"; then
+            if [ "$(current_for_token 2>/dev/null || true)" = "$token" ]; then
                 rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
             fi
             exit 0
@@ -2910,12 +2916,7 @@ cmd_for() {
     fi
     if ! reconcile_effective_state; then
         cancel_timer_session
-        restore_sleep_after_monitor_failure
-        return 1
-    fi
-    if ! ensure_active_lease_monitor; then
-        log "ERROR: Battery monitor failed to start; cancelling timer"
-        restore_sleep_after_monitor_failure
+        restore_sleep_after_runtime_failure
         return 1
     fi
     disown "$timer_pid" 2>/dev/null || true
@@ -2952,34 +2953,25 @@ cmd_run_command() {
 
     lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli" "$$"
     if ! reconcile_effective_state; then
-        log "ERROR: Battery monitor failed to start; refusing command session"
+        log "ERROR: Awake runtime is unavailable; refusing command session"
         lease_remove "run-command"
-        restore_sleep_after_monitor_failure
-        return 1
-    fi
-    if ! ensure_active_lease_monitor; then
-        log "ERROR: Battery monitor failed to start; refusing command session"
-        lease_remove "run-command"
-        reconcile_effective_state
+        restore_sleep_after_runtime_failure
         return 1
     fi
     log "Running: $*"
 
     local exit_code=0
-    local daemon_active=false
+    local agent_auto_active=false
     "$@" || exit_code=$?
 
-    if active_daemon_pid >/dev/null 2>&1; then
-        daemon_active=true
-    fi
+    agent_auto_enabled && agent_auto_active=true
 
     lease_remove "run-command"
     reconcile_effective_state
-    if timer_running || $daemon_active || [ "$(lease_count)" -gt 0 ]; then
+    if timer_running || $agent_auto_active || [ "$(lease_count)" -gt 0 ]; then
         log "Command finished (exit $exit_code) — leaving restore to active awake session"
     else
         log "Command finished (exit $exit_code)"
-        rm -f "$CAFFEINE_PID_FILE" "$STATE_FILE"
     fi
     return $exit_code
 }
@@ -3157,11 +3149,20 @@ CONF
 
     write_install_metadata
 
-    # An upgrade can inherit a manual lease created by an older Awake process.
-    # Do not leave that durable lease active unless this build verified its monitor.
-    if [ "$(lease_count)" -gt 0 ] && ! ensure_active_lease_monitor; then
-        log "ERROR: existing Awake session has no healthy battery monitor; restoring normal sleep"
-        restore_sleep_after_monitor_failure
+    # Lifecycle work belongs to installation. Normal toggles only verify this
+    # runtime and never rewrite or restart a launchd job.
+    if [ "${AWAKE_INSTALL_SKIP_RUNTIME:-0}" = "1" ]; then
+        log "Runtime installation skipped for staging build"
+    else
+        if ! install_runtime; then
+            log "ERROR: failed to install the Awake safety runtime"
+            restore_sleep_after_runtime_failure
+            return 1
+        fi
+    fi
+    if [ "${AWAKE_INSTALL_SKIP_RUNTIME:-0}" != "1" ] && [ "$(lease_count)" -gt 0 ] && ! reconcile_effective_state; then
+        log "ERROR: existing Awake session could not be reconciled; restoring normal sleep"
+        restore_sleep_after_runtime_failure
         return 1
     fi
 
@@ -3179,15 +3180,11 @@ CONF
 }
 
 cmd_uninstall() {
-    if launch_agent_loaded; then
-        /bin/launchctl bootout "$(launch_agent_target)" >/dev/null 2>&1 || true
-    fi
-    if lease_monitor_loaded; then
-        launchctl bootout "$(lease_monitor_target)" >/dev/null 2>&1 || true
-    fi
-    rm -f "$LAUNCH_AGENT_PATH"
-    rm -f "$LEASE_MONITOR_PATH" "$LEASE_MONITOR_READY_FILE" "$LEASE_MONITOR_HEARTBEAT_FILE"
     cmd_stop >/dev/null 2>&1 || true
+    restore_normal_sleep_settings >/dev/null 2>&1 || true
+    "$LAUNCHCTL_BIN" bootout "$(runtime_target)" >/dev/null 2>&1 || true
+    remove_legacy_jobs
+    rm -f "$RUNTIME_PATH" "$RUNTIME_READY_FILE" "$RUNTIME_HEARTBEAT_FILE" "$PID_FILE" "$AGENT_AUTO_FILE"
 
     log "Removing hooks..."
 
@@ -3222,7 +3219,7 @@ print('OK')
 # --- Main ---
 
 case "${1:-}" in
-    start)      cmd_daemon_start --bg ;;
+    start)      cmd_daemon_start ;;
     stop)       cmd_stop ;;
     sleep)      force_sleep ;;
     version|--version|-v) cmd_version ;;
@@ -3236,6 +3233,9 @@ case "${1:-}" in
     mode)       shift; cmd_mode "$@" ;;
     update)     shift; cmd_update "$@" ;;
     rules)      shift; cmd_rules "$@" ;;
+    agent-auto) shift; cmd_agent_auto "$@" ;;
+    runtime-status) cmd_runtime_status ;;
+    repair-runtime) install_runtime ;;
     for)        cmd_for "${2:-}" ;;
     until)      cmd_until "${2:-}" ;;
     cancel-timer) cmd_cancel_timer ;;
@@ -3244,12 +3244,11 @@ case "${1:-}" in
     screens)    shift; cmd_screens "$@" ;;
     install)    cmd_install ;;
     uninstall)  cmd_uninstall ;;
-    _daemon)    cmd_daemon ;;
-    _lease-monitor) cmd_lease_monitor ;;
+    _runtime)   cmd_runtime ;;
     "")         cmd_daemon_start ;;
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|agent-auto [on|off|status]|runtime-status|repair-runtime|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

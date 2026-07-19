@@ -36,6 +36,8 @@ chmod +x "$STUB_BIN"/*
 
 export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+export AWAKE_STATE_DIR="$TEST_ROOT/state"
+mkdir -p "$AWAKE_STATE_DIR"
 
 printf '{\n  "hooks": {}\n}\n' > "$TEST_HOME/.claude/settings.json"
 touch "$TEST_HOME/.codex/config.toml"

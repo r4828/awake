@@ -163,7 +163,7 @@ sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
 # shellcheck source=/dev/null
 source "$AWAKE_LIB"
 
-ensure_active_lease_monitor() { return 0; }
+ensure_runtime_ready() { return 0; }
 parse_duration() {
     echo 1
 }
@@ -220,6 +220,7 @@ setup_state() {
     MODE_FILE="$dir/default-mode"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+    RECONCILE_LOCK_FILE="$dir/reconcile-lock"
     WHY_FILE="$dir/awake-why"
     : > "$PMSET_LOG"
     set_agents_active 0
@@ -291,6 +292,63 @@ test_timer_restores_sleep_ok() {
     assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
     [ ! -f "$BASELINE_FILE" ]
     assert_not_contains "pmset sleepnow" "$PMSET_LOG"
+}
+
+test_timer_replaces_existing_manual_session() {
+    setup_state timer-replaces-manual
+    set_agents_active 0
+    activate_nosleep >/dev/null
+    [ -d "$LEASES_DIR/manual-toggle" ]
+    cmd_for 1 >/dev/null
+    [ ! -d "$LEASES_DIR/manual-toggle" ]
+    [ -d "$LEASES_DIR/manual-timer" ]
+    wait_for_timer_exit
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+}
+
+test_timer_preserves_running_command_lease() {
+    setup_state timer-with-command
+    set_agents_active 0
+    cmd_run_command sleep 2 >/dev/null &
+    local run_pid=$!
+    local attempt=0
+    while [ ! -d "$LEASES_DIR/run-command" ] && [ "$attempt" -lt 100 ]; do
+        sleep 0.01
+        attempt=$(( attempt + 1 ))
+    done
+    [ -d "$LEASES_DIR/run-command" ]
+    cmd_for 1 >/dev/null
+    sleep 1.2
+    [ -d "$LEASES_DIR/run-command" ]
+    [ ! -d "$LEASES_DIR/manual-timer" ]
+    [[ "$(cat "$STATE_FILE")" == nosleep* ]]
+    wait "$run_pid"
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+}
+
+test_background_reconcile_lock_uses_real_process_pid() {
+    setup_state reconcile-owner
+    local owner_file="$RECONCILE_LOCK_FILE"
+    (
+        acquire_reconcile_lock
+        sleep 0.2
+        release_reconcile_lock
+    ) &
+    local holder_pid=$!
+    local attempt=0
+    while [ ! -f "$owner_file" ] && [ "$attempt" -lt 50 ]; do
+        sleep 0.01
+        attempt=$(( attempt + 1 ))
+    done
+    [ -f "$owner_file" ]
+    local owner
+    owner="$(cat "$owner_file")"
+    local owner_pid="${owner%%:*}"
+    [ "$owner_pid" != "$$" ]
+    kill -0 "$owner_pid" 2>/dev/null
+    wait "$holder_pid"
+    [ ! -e "$RECONCILE_LOCK_FILE" ]
 }
 
 test_timer_stays_awake_when_agents_active() {
@@ -450,7 +508,7 @@ test_failed_recovery_keeps_ownership_for_retry() {
     [ ! -f "$OVERRIDE_MARKER_FILE" ]
 }
 
-test_cleanup_failure_requests_supervisor_restart() {
+test_runtime_signal_preserves_state_for_supervisor_restart() {
     setup_state cleanup-restart
     activate_nosleep >/dev/null
     lease_remove "manual-toggle"
@@ -460,11 +518,11 @@ test_cleanup_failure_requests_supervisor_restart() {
     echo $$ > "$PID_FILE"
 
     set +e
-    (export AWAKE_TEST_PMSET_FAIL_WRITE=1; daemon_signal_exit)
+    (export AWAKE_TEST_PMSET_FAIL_WRITE=1; runtime_signal_exit)
     local cleanup_status=$?
     set -e
 
-    assert_equals "1" "$cleanup_status"
+    assert_equals "0" "$cleanup_status"
     [ -f "$BASELINE_FILE" ]
     [ -f "$OVERRIDE_MARKER_FILE" ]
 
@@ -480,7 +538,7 @@ test_clean_signal_exit_does_not_request_restart() {
     echo $$ > "$PID_FILE"
 
     set +e
-    (daemon_signal_exit)
+    (runtime_signal_exit)
     local signal_status=$?
     set -e
 
@@ -621,6 +679,9 @@ test_temp_json() {
 }
 
 test_timer_restores_sleep_ok
+test_timer_replaces_existing_manual_session
+test_timer_preserves_running_command_lease
+test_background_reconcile_lock_uses_real_process_pid
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
 test_cancel_timer_command_clears_lease
@@ -631,7 +692,7 @@ test_launch_recovery_restores_after_crashed_daemon
 test_reconcile_repairs_kernel_state_mismatch
 test_launch_recovery_leaves_unowned_kernel_setting_alone
 test_failed_recovery_keeps_ownership_for_retry
-test_cleanup_failure_requests_supervisor_restart
+test_runtime_signal_preserves_state_for_supervisor_restart
 test_clean_signal_exit_does_not_request_restart
 test_launch_recovery_prunes_stale_timer_lease
 test_launch_recovery_prunes_orphan_rule_lease

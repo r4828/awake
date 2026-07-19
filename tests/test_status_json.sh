@@ -12,7 +12,6 @@ TEST_HOME="$TEST_ROOT/home"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.claude" "$TEST_HOME/.codex" "$TEST_HOME/.local/bin" "$TEST_HOME/.config/awake"
 
 cleanup() {
-    rm -rf /tmp/awake-leases /tmp/awake-daemon.lock /tmp/awake-state /tmp/awake-last-active /tmp/awake-caffeinate.pid /tmp/awake-for.pid /tmp/awake-for-end /tmp/awake-for-token /tmp/awake-why
     rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
@@ -84,15 +83,13 @@ chmod +x "$STUB_BIN"/*
 
 export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
+export AWAKE_STATE_DIR="$STATE_ROOT"
 
 printf '{\n  "hooks": {}\n}\n' > "$TEST_HOME/.claude/settings.json"
 touch "$TEST_HOME/.codex/config.toml"
 printf '#!/bin/bash\nexit 0\n' > "$TEST_HOME/.local/bin/awake-hook"
 printf '#!/bin/bash\nexit 0\n' > "$TEST_HOME/.local/bin/awake-notify"
 chmod +x "$TEST_HOME/.local/bin/awake-hook" "$TEST_HOME/.local/bin/awake-notify"
-
-rm -rf /tmp/awake-leases /tmp/awake-daemon.lock
-rm -f /tmp/awake-state /tmp/awake-last-active /tmp/awake-caffeinate.pid /tmp/awake-for.pid /tmp/awake-for-end /tmp/awake-for-token /tmp/awake-why
 
 json="$("$REPO_DIR/awake" status --json)"
 [[ "$json" == *'"defaultMode":"running"'* ]]
@@ -109,16 +106,16 @@ doctor_json="$("$REPO_DIR/awake" doctor --json)"
 [[ "$doctor_json" == *'"warnings":['* ]]
 
 "$REPO_DIR/awake" rules add process codex --mode running --reason 'Rule "quoted" value' >/dev/null
-mkdir -p /tmp/awake-leases/manual-toggle
-printf 'manual-toggle' > /tmp/awake-leases/manual-toggle/id
-printf 'manual' > /tmp/awake-leases/manual-toggle/type
-printf 'presenting' > /tmp/awake-leases/manual-toggle/mode
-printf 'Manual awake session' > /tmp/awake-leases/manual-toggle/reason
-printf '100' > /tmp/awake-leases/manual-toggle/priority
-printf '1' > /tmp/awake-leases/manual-toggle/started_at
-printf 'cli' > /tmp/awake-leases/manual-toggle/source
-printf '' > /tmp/awake-leases/manual-toggle/expires_at
-printf '1' > /tmp/awake-leases/manual-toggle/ready
+mkdir -p "$STATE_ROOT/awake-leases/manual-toggle"
+printf 'manual-toggle' > "$STATE_ROOT/awake-leases/manual-toggle/id"
+printf 'manual' > "$STATE_ROOT/awake-leases/manual-toggle/type"
+printf 'presenting' > "$STATE_ROOT/awake-leases/manual-toggle/mode"
+printf 'Manual awake session' > "$STATE_ROOT/awake-leases/manual-toggle/reason"
+printf '100' > "$STATE_ROOT/awake-leases/manual-toggle/priority"
+printf '1' > "$STATE_ROOT/awake-leases/manual-toggle/started_at"
+printf 'cli' > "$STATE_ROOT/awake-leases/manual-toggle/source"
+printf '' > "$STATE_ROOT/awake-leases/manual-toggle/expires_at"
+printf '1' > "$STATE_ROOT/awake-leases/manual-toggle/ready"
 json="$("$REPO_DIR/awake" status --json)"
 [[ "$json" == *'"leaseCount":1'* ]]
 [[ "$json" == *'"effectiveMode":"presenting"'* ]]

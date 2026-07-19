@@ -132,7 +132,7 @@ source "$AWAKE_LIB"
 
 log() { :; }
 notify() { :; }
-active_daemon_pid() { return 1; }
+active_runtime_pid() { return 1; }
 
 setup_state() {
     local dir="$STATE_ROOT/case"
@@ -154,6 +154,7 @@ setup_state() {
     BATTERY_GUARD_FILE="$dir/awake-battery-guard"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+    RECONCILE_LOCK_FILE="$dir/reconcile-lock"
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
     echo "agent-safe" > "$MODE_FILE"
     : > "$PMSET_LOG"

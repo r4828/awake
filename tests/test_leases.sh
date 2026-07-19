@@ -156,10 +156,10 @@ sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
 # shellcheck source=/dev/null
 source "$AWAKE_LIB"
 
-ensure_active_lease_monitor() { return 0; }
+ensure_runtime_ready() { return 0; }
 log() { :; }
 notify() { :; }
-active_daemon_pid() { return 1; }
+active_runtime_pid() { return 1; }
 
 setup_state() {
     local dir="$STATE_ROOT/case"
@@ -180,6 +180,7 @@ setup_state() {
     BATTERY_GUARD_FILE="$dir/awake-battery-guard"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+    RECONCILE_LOCK_FILE="$dir/reconcile-lock"
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
     echo "agent-safe" > "$MODE_FILE"
     : > "$PMSET_LOG"
@@ -349,5 +350,17 @@ lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 
 reconcile_effective_state
 [ -d "$LEASES_DIR/manual-toggle" ]
 assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+
+setup_state
+lease_create_or_update "rule-critical" "rule" "presenting" "Rule lease" 60 "" "test"
+reconcile_effective_state
+assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+ensure_runtime_ready() { return 1; }
+if reconcile_effective_state; then
+    echo "reconciliation unexpectedly succeeded without the safety runtime" >&2
+    exit 1
+fi
+assert_equals "normal" "$(cat "$STATE_FILE")"
+[ "$(lease_count)" -eq 0 ]
 
 echo "lease behavior tests passed"

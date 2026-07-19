@@ -18,7 +18,7 @@ Unlike generic keep-awake tools, `awake` is built around long-running AI coding 
 
 ## Highlights
 
-- Agent-aware daemon with process and hook-based detection
+- Persistent launchd-supervised runtime with process and hook-based agent detection
 - Lid-close prevention via `pmset disablesleep 1`
 - Native macOS menu bar app with panel, graph, logs, and setup flow
 - Multi-display blackout overlay with a global toggle hotkey
@@ -111,7 +111,7 @@ When you run AI coding agents (Claude Code, Codex CLI, Aider, etc.) on a laptop,
 
 ### CLI
 
-- `awake start` / `awake stop` for daemon control
+- `awake start` / `awake stop` to enable or disable automatic agent protection
 - `awake nosleep`, `awake yessleep`, and timed sessions like `awake for 2h`
 - `awake run <cmd>` to keep the Mac awake only while one command runs
 - `awake status`, `awake why`, and `awake doctor` for inspection and debugging
@@ -145,7 +145,7 @@ Most keep-awake apps are generic toggles. `awake` is opinionated:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    awake daemon                      │
+│                    awake runtime                     │
 │                                                      │
 │  every 15s:                                          │
 │    1. pgrep for agent processes                      │
@@ -163,7 +163,7 @@ Most keep-awake apps are generic toggles. `awake` is opinionated:
 └─────────────────────────────────────────────────────┘
 ```
 
-Every active Awake lease has a launchd-supervised battery monitor. Awake verifies its heartbeat before it keeps a session awake; launchd restarts the monitor after a crash, and it exits after the last lease ends.
+`awake install` creates one persistent per-user runtime supervised by launchd. Toggles only update leases and reconcile power state; they never rewrite a plist or restart a process. The runtime continuously handles battery protection, agent detection, stale-state recovery, and crash reconciliation. If it is unavailable, new wake requests fail closed and direct you to run `awake install`.
 
 ### Two layers of sleep prevention
 
@@ -281,65 +281,34 @@ Verify it works:
 sudo -n pmset -g    # Should print settings without asking for password
 ```
 
-### Step 4: Start
+### Step 4: Open the app
 
 ```bash
-awake start              # Start the daemon
 open ~/.local/bin/Awake.app   # Open the menu bar app (optional)
 ```
 
 No matter which install path you used, `awake install` resolves its own package or repo location, copies the helper files into `~/.local/bin`, builds the app bundle, wires supported agent integrations, and opens the app automatically after a successful install.
 
-### Optional: Auto-start on login
+### Optional: automatic agent protection
 
-Toggle in the menu bar app settings, or manually:
+The safety runtime is always installed at login. Automatic agent detection is a preference, not a process lifecycle control:
+
 ```bash
-# The app has a "Start at login" toggle that creates a LaunchAgent.
-# Or from the CLI:
-cat > ~/Library/LaunchAgents/com.awake.daemon.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.awake.daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOUR_USERNAME/.local/bin/awake</string>
-        <string>_daemon</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-    <key>StandardOutPath</key>
-    <string>/tmp/awake.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/awake.log</string>
-</dict>
-</plist>
-EOF
-# Replace YOUR_USERNAME, then:
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.awake.daemon.plist
+awake agent-auto on
+awake agent-auto off
+awake agent-auto status
 ```
 
-The LaunchAgent owns the foreground daemon process. It restarts Awake after a crash or `kill -9`, but leaves it stopped after a clean `awake stop`. On every launch, Awake reconciles its durable power baseline with the real `pmset` state before resuming agent detection.
+The existing `awake start` and `awake stop` commands remain as compatibility shortcuts for enabling and disabling automatic protection.
 
 ## Uninstall
 
 ```bash
 awake uninstall    # Removes hooks from Claude Code/Codex, restores sleep settings
-awake stop         # Stop the daemon
-
 # Then delete files:
 rm -rf ~/.local/bin/awake ~/.local/bin/awake-build-ui ~/.local/bin/AwakeApp ~/.local/bin/Awake.app
 rm -rf ~/.config/awake
-rm -f ~/Library/LaunchAgents/com.awake.daemon.plist
+rm -f ~/Library/LaunchAgents/com.awake.runtime.plist
 rm -f /tmp/awake-*
 sudo rm -f /etc/sudoers.d/pmset
 ```
@@ -349,8 +318,9 @@ sudo rm -f /etc/sudoers.d/pmset
 ### CLI commands
 
 ```bash
-awake start              # Start daemon (backgrounds itself, polls for agents)
-awake stop               # Stop daemon, kill caffeinate, restore normal sleep
+awake start              # Enable automatic agent protection
+awake stop               # Disable automatic protection and restore manual sessions
+awake agent-auto status  # Inspect the automatic-protection preference
 awake status             # Show current state, agents, battery, hooks
 
 awake nosleep            # Manual nosleep (full — prevents all sleep including lid-close)
@@ -488,7 +458,7 @@ This creates/updates a file per session. The daemon checks modification times �
   awake-codex-*          # Heartbeat files from Codex hooks
 
 ~/Library/LaunchAgents/
-  com.awake.daemon.plist # Optional: auto-start on login
+  com.awake.runtime.plist # Persistent safety runtime installed by awake install
 ```
 
 ## Troubleshooting
@@ -500,7 +470,7 @@ sudo bash -c 'echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/pmset" > /etc/sudoers
 sudo chmod 440 /etc/sudoers.d/pmset
 ```
 
-### Daemon starts but Mac still sleeps on lid close
+### Awake is on but the Mac still sleeps on lid close
 Check that `disablesleep` is set:
 ```bash
 sudo pmset -g | grep disablesleep

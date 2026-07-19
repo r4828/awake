@@ -20,7 +20,7 @@ rm -rf "$APP_PATH" "$ZIP_PATH"
 echo "[package-app] staging build in $STAGING_HOME"
 (
     cd "$ROOT_DIR"
-    HOME="$STAGING_HOME" bash ./install.sh >/dev/null
+    HOME="$STAGING_HOME" AWAKE_INSTALL_SKIP_RUNTIME=1 bash ./install.sh >/dev/null
 )
 
 cp -R "$STAGING_HOME/.local/bin/$APP_NAME" "$APP_PATH"

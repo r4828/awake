@@ -29,8 +29,7 @@ let PID_FILE = "/tmp/awake.pid"
 let FOR_PID_FILE = "/tmp/awake-for.pid"
 let FOR_END_FILE = "/tmp/awake-for-end"
 let DISPLAY_SLEEP_FILE = "/tmp/awake-display-sleep"
-let LAUNCH_AGENT_LABEL = "com.awake.daemon"
-let LAUNCH_AGENT_PATH = NSString("~/Library/LaunchAgents/com.awake.daemon.plist").expandingTildeInPath
+let AGENT_AUTO_FILE = NSString("~/.config/awake/agent-auto-enabled").expandingTildeInPath
 let HOOK_STALE_SECONDS: TimeInterval = 120
 let LOG_MAX_LINES = 200
 let CPU_TEMP_HISTORY_PATH = NSString("~/.config/awake/cpu-temp-history.json").expandingTildeInPath
@@ -83,8 +82,8 @@ func formatDuration(_ seconds: Int) -> String {
 
 @discardableResult
 func runCommand(_ executable: String, _ args: [String] = [], timeout: TimeInterval = 15) -> (Bool, String) {
-    let (ok, _, err) = runCommandCapture(executable, args, timeout: timeout)
-    return (ok, err)
+    let (ok, output, err) = runCommandCapture(executable, args, timeout: timeout)
+    return (ok, [output, err].filter { !$0.isEmpty }.joined(separator: "\n"))
 }
 
 func runCommandCapture(_ executable: String, _ args: [String] = [], timeout: TimeInterval = 15) -> (Bool, String, String) {
@@ -1476,15 +1475,7 @@ class PowerMonitor {
 // MARK: - LaunchAgent Helpers
 
 func isLaunchAgentInstalled() -> Bool {
-    FileManager.default.fileExists(atPath: LAUNCH_AGENT_PATH)
-}
-
-func launchAgentDomain() -> String {
-    "gui/\(getuid())"
-}
-
-func launchAgentTarget() -> String {
-    "\(launchAgentDomain())/\(LAUNCH_AGENT_LABEL)"
+    FileManager.default.fileExists(atPath: AGENT_AUTO_FILE)
 }
 
 func awakeDaemonIsRunning() -> Bool {
@@ -1493,64 +1484,11 @@ func awakeDaemonIsRunning() -> Bool {
 }
 
 func installLaunchAgent() -> Bool {
-    let dir = NSString("~/Library/LaunchAgents").expandingTildeInPath
-    let plist = """
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>\(LAUNCH_AGENT_LABEL)</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>\(AWAKE_CMD)</string>
-        <string>_daemon</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
-    <key>StandardOutPath</key>
-    <string>/tmp/awake.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/awake.log</string>
-</dict>
-</plist>
-"""
-    do {
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try plist.write(toFile: LAUNCH_AGENT_PATH, atomically: true, encoding: .utf8)
-        _ = runLaunchCtl(["bootout", launchAgentTarget()])
-        _ = runCommandCapture(AWAKE_CMD, ["stop"], timeout: 20)
-        guard runLaunchCtl(["bootstrap", launchAgentDomain(), LAUNCH_AGENT_PATH]) else {
-            try? FileManager.default.removeItem(atPath: LAUNCH_AGENT_PATH)
-            return false
-        }
-        return true
-    } catch {
-        return false
-    }
+    runCommandCapture(AWAKE_CMD, ["agent-auto", "on"], timeout: 10).0
 }
 
 func removeLaunchAgent() -> Bool {
-    let daemonWasRunning = awakeDaemonIsRunning()
-    _ = runLaunchCtl(["bootout", launchAgentTarget()])
-    do {
-        try FileManager.default.removeItem(atPath: LAUNCH_AGENT_PATH)
-        if daemonWasRunning {
-            _ = runCommandCapture(AWAKE_CMD, ["start"], timeout: 10)
-        }
-        return true
-    } catch {
-        return false
-    }
+    runCommandCapture(AWAKE_CMD, ["agent-auto", "off"], timeout: 10).0
 }
 
 // MARK: - Duration Option
@@ -1846,11 +1784,11 @@ class AwakeViewModel: ObservableObject {
             let agents = countAgents()
             let hookResult = countActiveHooks()
             let battery = getBattery()
-            let isDaemon = pidAlive(PID_FILE)
             let isTimer = pidAlive(FOR_PID_FILE)
             let uptimeVal = getUptime()
             let settingsSnapshot = self.fetchPowerSettingsSnapshot()
             let setupSnapshot = self.fetchSetupSnapshot()
+            let isDaemon = setupSnapshot?.daemonRunning ?? isLaunchAgentInstalled()
 
             DispatchQueue.main.async {
                 self.applyRefresh(
@@ -2461,9 +2399,17 @@ class AwakeViewModel: ObservableObject {
                 } else {
                     self.addLog("\(label) FAILED: \(err.prefix(80))", color: .red)
                 }
+                self.applyPowerStateFromDisk()
                 self.refreshAsync()
             }
         }
+    }
+
+    private func applyPowerStateFromDisk() {
+        let state = readFile(STATE_FILE) ?? "unknown"
+        powerState = state
+        isNosleep = state.hasPrefix("nosleep")
+        onStateChange?(state)
     }
 
     func nosleepOn() {
@@ -4162,7 +4108,8 @@ class AwakePanel: NSPanel {
             backing: .buffered,
             defer: false
         )
-        title = "awake"
+        title = ""
+        titleVisibility = .hidden
         isFloatingPanel = true
         level = .init(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
         isMovableByWindowBackground = true
@@ -4174,6 +4121,7 @@ class AwakePanel: NSPanel {
         minSize = NSSize(width: 300, height: 440)
         maxSize = NSSize(width: 480, height: 800)
         standardWindowButton(.miniaturizeButton)?.isHidden = true
+        standardWindowButton(.zoomButton)?.isHidden = true
     }
 }
 
@@ -4234,6 +4182,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         applyDockIconVisibility()
+        ensureBackendRuntime()
 
         // Status bar item — compact by default, but wide enough to show uptime while awake.
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -4295,6 +4244,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.refreshIcon()
             self?.showPanel()
+        }
+    }
+
+    private func ensureBackendRuntime() {
+        DispatchQueue.global(qos: .utility).async {
+            let status = runCommandCapture(AWAKE_CMD, ["runtime-status"], timeout: 3)
+            if !status.0 {
+                _ = runCommandCapture(AWAKE_CMD, ["repair-runtime"], timeout: 10)
+            }
         }
     }
 
