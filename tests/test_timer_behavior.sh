@@ -557,6 +557,34 @@ test_unowned_disablesleep_surfaces_in_warnings() {
     warnings_json > "$STATE_ROOT/cmd-out.txt" 2>&1
 
     assert_contains "Awake did not set it" "$STATE_ROOT/cmd-out.txt"
+    assert_contains "run 'awake fix' to clear it" "$STATE_ROOT/cmd-out.txt"
+}
+
+test_fix_rechecks_ownership_after_acquiring_lock() {
+    setup_state fix-recheck-race
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    # Simulate a session that becomes owned between the first guard and the
+    # post-lock recheck: report unowned on the first call, owned on the second.
+    # This exercises the recheck-under-lock branch that closes the race, which
+    # a test that is owned up front never reaches (it bails at the first guard).
+    local saved_fn
+    saved_fn="$(declare -f unowned_disablesleep_active)"
+    __recheck_calls=0
+    unowned_disablesleep_active() {
+        __recheck_calls=$(( __recheck_calls + 1 ))
+        [ "$__recheck_calls" -eq 1 ]
+    }
+
+    local rc=0
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1 || rc=$?
+
+    eval "$saved_fn"
+
+    assert_equals "0" "$rc"
+    assert_contains "an Awake session is now holding the override" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
 }
 
 test_failed_recovery_keeps_ownership_for_retry() {
@@ -771,6 +799,7 @@ test_fix_refuses_to_clear_owned_session
 test_fix_does_not_clear_while_reconcile_lock_held
 test_unowned_disablesleep_surfaces_in_why
 test_unowned_disablesleep_surfaces_in_warnings
+test_fix_rechecks_ownership_after_acquiring_lock
 test_failed_recovery_keeps_ownership_for_retry
 test_runtime_signal_preserves_state_for_supervisor_restart
 test_clean_signal_exit_does_not_request_restart
