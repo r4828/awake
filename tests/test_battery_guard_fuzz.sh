@@ -235,15 +235,15 @@ grep -q "pmset sleepnow" "$PMSET_LOG"
 
 setup_state
 write_batt_case 5 battery split
-if enforce_battery_guard; then
-    echo "battery guard should warn but not force sleep at exactly BATTERY_CRITICAL" >&2
+enforce_battery_guard
+if ! grep -q "pmset sleepnow" "$PMSET_LOG"; then
+    echo "battery guard did not force sleep at exactly BATTERY_CRITICAL" >&2
     exit 1
 fi
-if grep -q "pmset sleepnow" "$PMSET_LOG"; then
-    echo "battery guard force-slept at exactly BATTERY_CRITICAL" >&2
+if [ ! -f "$PMSET_STATE_DIR/pmset-slept" ]; then
+    echo "battery guard did not record sleep at exactly BATTERY_CRITICAL" >&2
     exit 1
 fi
-assert_equals "warn" "$(cat "$BATTERY_GUARD_FILE")"
 
 setup_state
 write_batt_case 4 ac split

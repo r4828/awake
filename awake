@@ -1147,7 +1147,7 @@ enforce_battery_guard() {
 
     stage="$(read_file_value "$BATTERY_GUARD_FILE" 2>/dev/null || true)"
 
-    if [ "$batt" -lt "$BATTERY_CRITICAL" ] 2>/dev/null; then
+    if [ "$batt" -le "$BATTERY_CRITICAL" ] 2>/dev/null; then
         if [ "$stage" != "critical" ]; then
             log "CRITICAL: Battery at ${batt}% — forcing sleep"
             notify "awake" "Battery critical (${batt}%). Sleeping now."
@@ -1888,12 +1888,32 @@ recover_power_state_on_launch() {
 
 activate_nosleep() {
     lease_create_or_update "manual-toggle" "manual" "presenting" "Manual awake session" 100 "" "cli"
-    reconcile_effective_state
+    reconcile_effective_state || return 1
+    ensure_active_lease_monitor || {
+        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
+        activate_yessleep
+        return 1
+    }
 }
 
 activate_nosleep_display() {
     lease_create_or_update "manual-toggle" "manual" "running" "Manual awake session with display sleep allowed" 100 "" "cli"
-    reconcile_effective_state
+    reconcile_effective_state || return 1
+    ensure_active_lease_monitor || {
+        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
+        activate_yessleep
+        return 1
+    }
+}
+
+activate_default_manual_session() {
+    lease_create_or_update "manual-toggle" "manual" "$(current_default_mode)" "Manual awake session" 100 "" "cli"
+    reconcile_effective_state || return 1
+    ensure_active_lease_monitor || {
+        log "ERROR: Battery monitor failed to start; refusing manual Awake session"
+        activate_yessleep
+        return 1
+    }
 }
 
 activate_yessleep() {
@@ -2110,8 +2130,14 @@ cmd_setup() {
 
 cmd_daemon_start() {
     local background=false
+    local lease_monitor=false
     local existing_pid
-    [ "${1:-}" = "--bg" ] && background=true
+    for arg in "$@"; do
+        case "$arg" in
+            --bg) background=true ;;
+            --lease-monitor) lease_monitor=true ;;
+        esac
+    done
     ensure_runtime_dirs
 
     existing_pid="$(active_daemon_pid 2>/dev/null || true)"
@@ -2139,16 +2165,43 @@ cmd_daemon_start() {
 
     if $background; then
         log "Starting in background..."
-        nohup "$0" _daemon </dev/null >>/tmp/awake.log 2>&1 &
-        echo $! > "$PID_FILE"
-        log "PID $(cat "$PID_FILE") — log: /tmp/awake.log"
-        return 0
+        local daemon_args=("_daemon")
+        $lease_monitor && daemon_args+=("--lease-monitor")
+        nohup "$0" "${daemon_args[@]}" </dev/null >>/tmp/awake.log 2>&1 &
+        local launched_pid=$!
+        local attempt=0
+        while [ "$attempt" -lt 20 ]; do
+            if pid_matches_awake_daemon "$launched_pid"; then
+                echo "$launched_pid" > "$PID_FILE"
+                log "PID $launched_pid — log: /tmp/awake.log"
+                return 0
+            fi
+            sleep 0.05
+            attempt=$(( attempt + 1 ))
+        done
+        log "ERROR: daemon did not start"
+        return 1
     fi
 
-    "$0" _daemon
+    if $lease_monitor; then
+        "$0" _daemon --lease-monitor
+    else
+        "$0" _daemon
+    fi
+}
+
+ensure_active_lease_monitor() {
+    # Manual sessions must keep their battery floor even when the optional
+    # agent daemon is off. This short-lived monitor exits with the last lease.
+    [ "${AWAKE_LEASE_MONITOR_ENABLED:-1}" = "1" ] || return 0
+    [ "$(lease_count)" -gt 0 ] || return 0
+    active_daemon_pid >/dev/null 2>&1 && return 0
+    cmd_daemon_start --bg --lease-monitor
 }
 
 cmd_daemon() {
+    local lease_monitor=false
+    [ "${1:-}" = "--lease-monitor" ] && lease_monitor=true
     trap cleanup EXIT
     trap daemon_signal_exit INT TERM
     ensure_runtime_dirs
@@ -2165,9 +2218,20 @@ cmd_daemon() {
     local grace_start=0
 
     while true; do
+        if $lease_monitor && [ "$(lease_count)" -eq 0 ]; then
+            log "No active leases — stopping battery monitor"
+            return 0
+        fi
+
         # --- Battery guard (always, regardless of agent source) ---
         if enforce_battery_guard; then
             grace_start=0
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+
+        if $lease_monitor; then
+            reconcile_effective_state
             sleep "$POLL_INTERVAL"
             continue
         fi
@@ -2671,6 +2735,12 @@ cmd_for() {
         cancel_timer_session
         return 1
     fi
+    if ! ensure_active_lease_monitor; then
+        log "ERROR: Battery monitor failed to start; cancelling timer"
+        cancel_timer_session
+        reconcile_effective_state
+        return 1
+    fi
     disown "$timer_pid" 2>/dev/null || true
 
     echo "nosleep ON for ${mins}m, then Sleep OK. Cancel with: awake stop"
@@ -2704,7 +2774,13 @@ cmd_run_command() {
     fi
 
     lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli" "$$"
-    reconcile_effective_state
+    reconcile_effective_state || return 1
+    if ! ensure_active_lease_monitor; then
+        log "ERROR: Battery monitor failed to start; refusing command session"
+        lease_remove "run-command"
+        reconcile_effective_state
+        return 1
+    fi
     log "Running: $*"
 
     local exit_code=0
@@ -2956,7 +3032,7 @@ case "${1:-}" in
     stop)       cmd_stop ;;
     sleep)      force_sleep ;;
     version|--version|-v) cmd_version ;;
-    on)         lease_create_or_update "manual-toggle" "manual" "$(current_default_mode)" "Manual awake session" 100 "" "cli"; reconcile_effective_state ;;
+    on)         activate_default_manual_session ;;
     nosleep)    activate_nosleep ;;
     nosleep-display) activate_nosleep_display ;;
     yessleep)   activate_yessleep ;;
@@ -2974,7 +3050,7 @@ case "${1:-}" in
     screens)    shift; cmd_screens "$@" ;;
     install)    cmd_install ;;
     uninstall)  cmd_uninstall ;;
-    _daemon)    cmd_daemon ;;
+    _daemon)    shift; cmd_daemon "$@" ;;
     "")         cmd_daemon_start ;;
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;

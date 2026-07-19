@@ -91,6 +91,7 @@ export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 export AWAKE_TEST_PMSET_LOG="$PMSET_LOG"
 export AWAKE_TEST_PMSET_STATE_DIR="$PMSET_STATE_DIR"
+export AWAKE_LEASE_MONITOR_ENABLED=0
 
 AWAKE_LIB="$TEST_ROOT/awake-lib.sh"
 sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"

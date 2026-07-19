@@ -158,10 +158,12 @@ Most keep-awake apps are generic toggles. `awake` is opinionated:
 │         → sudo pmset disablesleep 0                  │
 │         → kill caffeinate                            │
 │         → write "normal" to /tmp/awake-state         │
-│    5. if battery < BATTERY_CRITICAL (default 5%):    │
+│    5. if battery ≤ BATTERY_CRITICAL (default 5%):    │
 │         → force sleep regardless of agents           │
 └─────────────────────────────────────────────────────┘
 ```
+
+Manual sessions, timers, and `awake run` also start a short-lived battery monitor when the agent daemon is off. The monitor exits after the last protected session ends.
 
 ### Two layers of sleep prevention
 
@@ -185,7 +187,7 @@ The daemon detects agents two ways:
      │    (no agents for 5min)      │
      └──────────────────────────────┘
 
-  At any point: battery < 5% → force sleep
+  At any point: battery ≤ 5% → force sleep
 ```
 
 State is stored in `/tmp/awake-state` so the menu bar app and CLI can read it without IPC.
@@ -409,7 +411,7 @@ POLL_INTERVAL=15
 # Prevents sleep during brief pauses between agent runs
 GRACE_SECONDS=300
 
-# Force sleep when battery drops below this % (even if agents are running)
+# Force sleep when battery reaches this % (even if agents are running)
 BATTERY_CRITICAL=5
 
 # Send a macOS notification when battery drops below this %
